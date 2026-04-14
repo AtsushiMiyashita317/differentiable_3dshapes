@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence, Tuple
+from typing import Literal, Sequence, Tuple
 
 import numpy as np
 from PIL import Image
@@ -380,22 +380,56 @@ def _get_meshes(
     }
 
 
-def _downsample_mean(image_hwc: np.ndarray | torch.Tensor, factor: int) -> np.ndarray | torch.Tensor:
+def _downsample_mean(
+    image_hwc: np.ndarray | torch.Tensor,
+    factor: int,
+    prefilter_sigma: float = 0.0,
+    filter_order: Literal["pre", "post"] = "pre",
+) -> np.ndarray | torch.Tensor:
     if factor <= 1:
         return image_hwc
     if torch.is_tensor(image_hwc):
         if image_hwc.ndim == 3:
             h, w, _ = image_hwc.shape
-            # Use area interpolation for better antialiasing quality than block mean.
             x = image_hwc.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
-            x = F.interpolate(x, size=(h // factor, w // factor), mode="area")
-            return x.squeeze(0).permute(1, 2, 0)
-        if image_hwc.ndim == 4:
-            b, h, w, _ = image_hwc.shape
+            squeeze_batch = True
+        elif image_hwc.ndim == 4:
+            _, h, w, _ = image_hwc.shape
             x = image_hwc.permute(0, 3, 1, 2)  # (B, C, H, W)
-            x = F.interpolate(x, size=(h // factor, w // factor), mode="area")
-            return x.permute(0, 2, 3, 1)
-        raise ValueError("torch image tensor must be HWC or BHWC")
+            squeeze_batch = False
+        else:
+            raise ValueError("torch image tensor must be HWC or BHWC")
+
+        sigma = float(prefilter_sigma)
+
+        def _gaussian_blur_nchw(inp: torch.Tensor, sig: float) -> torch.Tensor:
+            radius = max(1, int(math.ceil(2.0 * sig)))
+            ksize = radius * 2 + 1
+            coords = torch.arange(-radius, radius + 1, device=inp.device, dtype=inp.dtype)
+            kernel_1d = torch.exp(-(coords * coords) / (2.0 * sig * sig))
+            kernel_1d = kernel_1d / torch.clamp(kernel_1d.sum(), min=1e-12)
+            channels = inp.shape[1]
+            kernel_x = kernel_1d.view(1, 1, 1, ksize).expand(channels, 1, 1, ksize)
+            kernel_y = kernel_1d.view(1, 1, ksize, 1).expand(channels, 1, ksize, 1)
+            out = F.conv2d(inp, kernel_x, padding=(0, radius), groups=channels)
+            out = F.conv2d(out, kernel_y, padding=(radius, 0), groups=channels)
+            return out
+
+        if filter_order not in ("pre", "post"):
+            raise ValueError(f"filter_order must be 'pre' or 'post', got {filter_order!r}")
+
+        if sigma > 0.0 and filter_order == "pre":
+            # Smooth high-res image before area downsampling.
+            x = _gaussian_blur_nchw(x, sigma)
+
+        # Area interpolation keeps energy stable after supersampling.
+        x = F.interpolate(x, size=(h // factor, w // factor), mode="area")
+        if sigma > 0.0 and filter_order == "post":
+            # Smooth only after resize (requested variant).
+            x = _gaussian_blur_nchw(x, sigma)
+        if squeeze_batch:
+            return x.squeeze(0).permute(1, 2, 0)
+        return x.permute(0, 2, 3, 1)
     h, w, c = image_hwc.shape
     image_hwc = image_hwc.reshape(h // factor, factor, w // factor, factor, c)
     return image_hwc.mean(axis=(1, 3))
@@ -532,29 +566,178 @@ def _ray_march_object(
     eps: float = 1e-3,
     t_far: float = 100.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    b, h, w, _ = ray_dir.shape
-    t = torch.full((b, h, w), 1e-3, device=ray_dir.device, dtype=ray_dir.dtype)
-    hit = torch.zeros((b, h, w), device=ray_dir.device, dtype=torch.bool)
-    center_world_b = center_world[:, None, None, :]
-    scale_xyz_b = scale_xyz[:, None, None, :]
-    scale_min = torch.min(scale_xyz_b)
+    # Kept for backward-compatible signature; intersection is now analytic.
+    _ = max_steps, eps
+    ray_origin = cam_pos[:, None, None, :]
+    t_hit = _ray_object_first_hit_t(
+        ray_origin_world=ray_origin,
+        ray_dir_world=ray_dir,
+        shape_id=shape_id,
+        center_world=center_world[:, None, None, :],
+        scale_xyz=scale_xyz[:, None, None, :],
+        t_far=t_far,
+    )
+    hit = torch.isfinite(t_hit)
+    t_out = torch.where(hit, t_hit, torch.full_like(t_hit, float(t_far)))
+    return hit, t_out
 
-    for _ in range(max_steps):
-        active = (~hit) & (t < t_far)
-        p = cam_pos[:, None, None, :] + ray_dir * t[..., None]
-        d = _sdf_object_world(
-            p,
-            shape_id,
-            center_world_b,
-            scale_xyz_b,
-            scale_min=scale_min,
+
+def _ray_object_first_hit_t(
+    ray_origin_world: torch.Tensor,
+    ray_dir_world: torch.Tensor,
+    shape_id: int,
+    center_world: torch.Tensor,
+    scale_xyz: torch.Tensor,
+    t_far: float = 100.0,
+    t_min: float = 1e-6,
+    softmin_tau: float | None = None,
+) -> torch.Tensor:
+    dtype = ray_dir_world.dtype
+    device = ray_dir_world.device
+    dkey = _device_cache_key(device)
+    t_eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, float(t_min))
+    den_eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1e-12)
+    sqrt_eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1e-12)
+    one = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1.0)
+    neg_one = _cached_scalar_tensor(dkey[0], dkey[1], dtype, -1.0)
+    inf = _cached_scalar_tensor(dkey[0], dkey[1], dtype, float("inf"))
+    t_far_t = _cached_scalar_tensor(dkey[0], dkey[1], dtype, float(t_far))
+    finite_cap = _cached_scalar_tensor(dkey[0], dkey[1], dtype, float(t_far) + 4.0)
+
+    scale_xyz_safe = torch.clamp(scale_xyz, min=1e-8)
+    ro = (ray_origin_world - center_world) / scale_xyz_safe
+    rd = ray_dir_world / scale_xyz_safe
+
+    t_hit = torch.full_like(ray_dir_world[..., 0], float("inf"))
+    t_candidates: list[torch.Tensor] = []
+    valid_candidates: list[torch.Tensor] = []
+
+    def _add_candidate(t_candidate: torch.Tensor, valid: torch.Tensor) -> None:
+        nonlocal t_hit
+        t_candidate_clean = torch.nan_to_num(
+            t_candidate,
+            nan=float(t_far) + 4.0,
+            posinf=float(t_far) + 4.0,
+            neginf=-float(t_far) - 4.0,
         )
-        new_hit = active & (torch.abs(d) < eps)
-        hit = hit | new_hit
-        step = torch.clamp(d, min=5e-4, max=0.5)
-        t = torch.where(active & (~new_hit), t + step, t)
+        t_candidates.append(t_candidate_clean)
+        valid_candidates.append(valid.to(dtype))
+        t_valid = torch.where(valid & (t_candidate_clean > t_eps), t_candidate_clean, inf)
+        t_hit = torch.minimum(t_hit, t_valid)
 
-    return hit & (t < t_far), t
+    ox, oy, oz = ro[..., 0], ro[..., 1], ro[..., 2]
+    dx, dy, dz = rd[..., 0], rd[..., 1], rd[..., 2]
+
+    if shape_id == 0:
+        parallel = torch.abs(rd) < den_eps
+        outside_parallel = parallel & ((ro < neg_one) | (ro > one))
+        no_hit_parallel = outside_parallel.any(dim=-1)
+
+        rd_safe = torch.where(torch.abs(rd) > den_eps, rd, torch.where(rd >= 0.0, den_eps, -den_eps))
+        inv_rd = one / rd_safe
+        t0 = (neg_one - ro) * inv_rd
+        t1 = (one - ro) * inv_rd
+        t_near_axis = torch.minimum(t0, t1)
+        t_far_axis = torch.maximum(t0, t1)
+        t_near_axis = torch.where(parallel, -inf, t_near_axis)
+        t_far_axis = torch.where(parallel, inf, t_far_axis)
+
+        t_near = t_near_axis.max(dim=-1).values
+        t_far_box = t_far_axis.min(dim=-1).values
+        valid = (~no_hit_parallel) & (t_far_box >= t_near) & (t_far_box > t_eps)
+        t_box = torch.where(t_near > t_eps, t_near, t_far_box)
+        _add_candidate(t_box, valid)
+    elif shape_id == 1:
+        a = dx * dx + dz * dz
+        bq = 2.0 * (ox * dx + oz * dz)
+        c = ox * ox + oz * oz - 1.0
+        disc = bq * bq - 4.0 * a * c
+        sqrt_disc = torch.sqrt(torch.clamp(disc, min=sqrt_eps))
+        den = 2.0 * a
+        den_ok = torch.abs(den) > den_eps
+        root_ok = (disc >= 0.0) & den_ok
+        den_safe = torch.where(den_ok, den, one)
+
+        t0 = (-bq - sqrt_disc) / den_safe
+        t1 = (-bq + sqrt_disc) / den_safe
+        y0 = oy + t0 * dy
+        y1 = oy + t1 * dy
+        _add_candidate(t0, root_ok & (y0 >= -1.0) & (y0 <= 1.0))
+        _add_candidate(t1, root_ok & (y1 >= -1.0) & (y1 <= 1.0))
+
+        dy_ok = torch.abs(dy) > den_eps
+        dy_safe = torch.where(dy_ok, dy, one)
+        t_cap_top = (one - oy) / dy_safe
+        x_top = ox + t_cap_top * dx
+        z_top = oz + t_cap_top * dz
+        _add_candidate(t_cap_top, dy_ok & (x_top * x_top + z_top * z_top <= 1.0))
+
+        t_cap_bot = (neg_one - oy) / dy_safe
+        x_bot = ox + t_cap_bot * dx
+        z_bot = oz + t_cap_bot * dz
+        _add_candidate(t_cap_bot, dy_ok & (x_bot * x_bot + z_bot * z_bot <= 1.0))
+    elif shape_id == 2:
+        a = dx * dx + dy * dy + dz * dz
+        bq = 2.0 * (ox * dx + oy * dy + oz * dz)
+        c = ox * ox + oy * oy + oz * oz - 1.0
+        disc = bq * bq - 4.0 * a * c
+        sqrt_disc = torch.sqrt(torch.clamp(disc, min=sqrt_eps))
+        den = 2.0 * a
+        den_ok = torch.abs(den) > den_eps
+        root_ok = (disc >= 0.0) & den_ok
+        den_safe = torch.where(den_ok, den, one)
+        t0 = (-bq - sqrt_disc) / den_safe
+        t1 = (-bq + sqrt_disc) / den_safe
+        _add_candidate(t0, root_ok)
+        _add_candidate(t1, root_ok)
+    else:
+        a = dx * dx + dz * dz
+        bq = 2.0 * (ox * dx + oz * dz)
+        c = ox * ox + oz * oz - 1.0
+        disc = bq * bq - 4.0 * a * c
+        sqrt_disc = torch.sqrt(torch.clamp(disc, min=sqrt_eps))
+        den = 2.0 * a
+        den_ok = torch.abs(den) > den_eps
+        root_ok = (disc >= 0.0) & den_ok
+        den_safe = torch.where(den_ok, den, one)
+        t0 = (-bq - sqrt_disc) / den_safe
+        t1 = (-bq + sqrt_disc) / den_safe
+        y0 = oy + t0 * dy
+        y1 = oy + t1 * dy
+        _add_candidate(t0, root_ok & (y0 >= -1.0) & (y0 <= 1.0))
+        _add_candidate(t1, root_ok & (y1 >= -1.0) & (y1 <= 1.0))
+
+        a_s = dx * dx + dy * dy + dz * dz
+        den_s = 2.0 * a_s
+        den_s_ok = torch.abs(den_s) > den_eps
+        den_s_safe = torch.where(den_s_ok, den_s, one)
+        for cy in (-1.0, 1.0):
+            ocy = oy - cy
+            b_s = 2.0 * (ox * dx + ocy * dy + oz * dz)
+            c_s = ox * ox + ocy * ocy + oz * oz - 1.0
+            disc_s = b_s * b_s - 4.0 * a_s * c_s
+            sqrt_disc_s = torch.sqrt(torch.clamp(disc_s, min=sqrt_eps))
+            root_s_ok = (disc_s >= 0.0) & den_s_ok
+            ts0 = (-b_s - sqrt_disc_s) / den_s_safe
+            ts1 = (-b_s + sqrt_disc_s) / den_s_safe
+            _add_candidate(ts0, root_s_ok)
+            _add_candidate(ts1, root_s_ok)
+
+    if softmin_tau is not None and softmin_tau > 0.0 and len(t_candidates) > 0:
+        tau_t = torch.clamp(
+            torch.as_tensor(softmin_tau, device=device, dtype=dtype),
+            min=1e-6,
+        )
+        tc = torch.stack(t_candidates, dim=0)
+        tc = torch.clamp(tc, min=-finite_cap, max=finite_cap)
+        vc = torch.stack(valid_candidates, dim=0)
+        t_gate = torch.sigmoid((tc - t_eps) / tau_t)
+        # Penalize invalid candidates smoothly instead of hard masking.
+        score = tc + (1.0 - vc * t_gate) * (t_far_t + 2.0)
+        score = torch.clamp(score, min=-finite_cap, max=finite_cap)
+        return -tau_t * torch.logsumexp(-score / tau_t, dim=0)
+
+    return torch.where(t_hit < t_far_t, t_hit, torch.full_like(t_hit, float("inf")))
 
 
 def _normal_from_sdf(
@@ -653,7 +836,8 @@ def _render_room(
         closer = valid & (t > 1e-6) & (t < depth)
         depth = torch.where(closer, t, depth)
         color = torch.where(closer[..., None], c, color)
-        surface_id = torch.where(closer, torch.full_like(surface_id, surf_id), surface_id)
+        surf_id_t = torch.tensor(surf_id, device=device, dtype=surface_id.dtype)
+        surface_id = torch.where(closer, surf_id_t, surface_id)
         hit_points = torch.where(closer[..., None], p, hit_points)
 
     # floor
@@ -704,24 +888,45 @@ def _soft_shadow_floor(
 ) -> torch.Tensor:
     if floor_points.numel() == 0:
         return torch.empty(floor_mask.shape, device=floor_points.device, dtype=floor_points.dtype)
-    b, h, w, _ = floor_points.shape
-    s = torch.linspace(0.02, 0.98, n_samples, device=floor_points.device, dtype=floor_points.dtype)
-    s = s[None, None, None, :, None]
+    _ = n_samples
     ray = light_pos_world[:, None, None, :] - floor_points
-    dist = torch.linalg.norm(ray, dim=-1, keepdim=True)
-    ray_dir = ray / torch.clamp(dist, min=1e-8)
-    samples = floor_points[:, :, :, None, :] + ray_dir[:, :, :, None, :] * (dist[:, :, :, None, :] * s)
-    scale_min = torch.min(scale_xyz[:, None, :])
-    d = _sdf_object_world(
-        samples.reshape(b, -1, 3),
+    dist = torch.linalg.norm(ray, dim=-1)
+    ray_dir = ray / torch.clamp(dist[..., None], min=1e-8)
+    center_world_b = center_world[:, None, None, :]
+    scale_xyz_b = scale_xyz[:, None, None, :]
+    t_hit = _ray_object_first_hit_t(
+        ray_origin_world=floor_points,
+        ray_dir_world=ray_dir,
+        shape_id=shape_id,
+        center_world=center_world_b,
+        scale_xyz=scale_xyz_b,
+        t_far=100.0,
+        t_min=1e-6,
+        softmin_tau=max(float(sigma), 1e-4),
+    )
+
+    # Smooth window: only intersections between 4% and 96% of light segment occlude.
+    start_t = 0.04 * dist
+    end_t = 0.96 * dist
+    sigma_t = torch.clamp(torch.as_tensor(sigma, device=dist.device, dtype=dist.dtype), min=1e-6)
+    occ_exit = torch.sigmoid((end_t - t_hit) / sigma_t)
+
+    # Fill the "donut" artifact: when first hit is before start_t, the segment can still
+    # be inside the object at start_t and should cast shadow.
+    p_start = floor_points + ray_dir * start_t[..., None]
+    scale_min = torch.min(scale_xyz_b)
+    d_start = _sdf_object_world(
+        p_start,
         shape_id,
-        center_world[:, None, :],
-        scale_xyz[:, None, :],
+        center_world_b,
+        scale_xyz_b,
         scale_min=scale_min,
-    ).reshape(b, h, w, n_samples)
-    occ = torch.sigmoid((-d) / sigma)
-    # Visibility in [0,1], stronger than mean-transmittance and closer to hard-shadow behavior.
-    vis = 1.0 - occ.max(dim=-1).values
+    )
+    # Continuous inside weight (no hard branch) to preserve gradients near contact.
+    inside_w = torch.sigmoid((-d_start) / sigma_t)
+    # Smooth union of hit-based occlusion and start-inside occlusion.
+    occ = 1.0 - (1.0 - occ_exit) * (1.0 - inside_w)
+    vis = 1.0 - occ
     vis = torch.clamp(vis, 0.0, 1.0)
     return torch.where(floor_mask, vis, torch.ones_like(vis))
 
@@ -755,6 +960,8 @@ def render_3dshapes_image(
     orientation_period: float | torch.Tensor = 1.0,
     shadow_strength: float | torch.Tensor = 10.0,
     ssaa_scale: int = 4,
+    downsample_prefilter_sigma: float = 0.9,
+    downsample_filter_order: Literal["pre", "post"] = "pre",
     image_size: int | Tuple[int, int] = 64,
     lighting_config: LightingConfig | None = None,
     mesh_resolution_config: MeshResolutionConfig | None = None,
@@ -972,7 +1179,12 @@ def render_3dshapes_image(
     out = torch.where(obj_front[..., None], obj_color, room_color)
 
     if ssaa_scale > 1:
-        out = _downsample_mean(out, ssaa_scale)
+        out = _downsample_mean(
+            out,
+            ssaa_scale,
+            prefilter_sigma=downsample_prefilter_sigma,
+            filter_order=downsample_filter_order,
+        )
     if output_chw:
         out = out.permute(0, 3, 1, 2)
     if bsz == 1:
@@ -990,8 +1202,10 @@ class Render3DShapesModule(nn.Module):
         *,
         hue_v: float | torch.Tensor = 0.9,
         orientation_period: float | torch.Tensor = 1.0,
-        shadow_strength: float | torch.Tensor = 10.0,
+        shadow_strength: float | torch.Tensor = 1.0,
         ssaa_scale: int = 4,
+        downsample_prefilter_sigma: float = 0.9,
+        downsample_filter_order: Literal["pre", "post"] = "pre",
         image_size: int | Tuple[int, int] = 64,
         lighting_config: LightingConfig | None = None,
         mesh_resolution_config: MeshResolutionConfig | None = None,
@@ -1005,6 +1219,8 @@ class Render3DShapesModule(nn.Module):
         self.orientation_period = orientation_period
         self.shadow_strength = shadow_strength
         self.ssaa_scale = ssaa_scale
+        self.downsample_prefilter_sigma = downsample_prefilter_sigma
+        self.downsample_filter_order = downsample_filter_order
         self.image_size = image_size
         self.lighting_config = lighting_config
         self.mesh_resolution_config = mesh_resolution_config
@@ -1028,6 +1244,8 @@ class Render3DShapesModule(nn.Module):
             orientation_period=self.orientation_period,
             shadow_strength=self.shadow_strength,
             ssaa_scale=self.ssaa_scale,
+            downsample_prefilter_sigma=self.downsample_prefilter_sigma,
+            downsample_filter_order=self.downsample_filter_order,
             image_size=self.image_size,
             lighting_config=self.lighting_config,
             mesh_resolution_config=self.mesh_resolution_config,
@@ -1202,14 +1420,16 @@ if __name__ == "__main__":
         hue_v=0.9,
         orientation_period=1.0,
         shadow_strength=0.8,
-        ssaa_scale=4,
-        image_size=64,
+        ssaa_scale=2,
+        image_size=128,
         lighting_config=light_cfg,
         mesh_resolution_config=mesh_res_cfg,
         camera_config=cam_cfg,
         room_config=room_cfg,
         object_config=obj_cfg,
         output_chw=True,
+        downsample_prefilter_sigma=0.0,
+        downsample_filter_order="post",
     )
     renderer = renderer.to(device)
 
@@ -1220,8 +1440,8 @@ if __name__ == "__main__":
         size=1.0,
         orientation=0.0,
         floor_hue=0.0,
-        wall_hue=0.0,
-        object_hue=0.0,
+        wall_hue=0.33,
+        object_hue=0.66,
         # orientation_period=1.0,
         # lighting_config=light_cfg,
         # mesh_resolution_config=mesh_res_cfg,
@@ -1237,7 +1457,7 @@ if __name__ == "__main__":
 
     # Build GIF frames:
     # rows = orientation / size / floor_hue / wall_hue / object_hue, cols = image | differential.
-    n_frames = 40
+    n_frames = 64
     orientation_vals = np.linspace(0.0, 1.0, n_frames, endpoint=False, dtype=np.float32)
     size_vals = np.linspace(0.7, 1.5, n_frames, endpoint=True, dtype=np.float32)
     color_vals = np.linspace(0.0, 1.0, n_frames, endpoint=False, dtype=np.float32)
@@ -1258,7 +1478,7 @@ if __name__ == "__main__":
     base_wall = torch.full((n_frames,), float(main_params["wall_hue"]), dtype=torch.float32, device=device)
     base_obj = torch.full((n_frames,), float(main_params["object_hue"]), dtype=torch.float32, device=device)
 
-    chunk_size = 8
+    chunk_size = 64
 
     # row_frames_by_factor[k][t] is the k-th factor row at time t.
     row_frames_by_factor: list[list[np.ndarray]] = []

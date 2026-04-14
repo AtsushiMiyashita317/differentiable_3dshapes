@@ -1,0 +1,686 @@
+device=cpu dtype=torch.float32 batch=4 repeats=2
+total_elapsed=0.1345s avg_per_call=0.067267s
+
+Timer unit: 1e-09 s
+
+Total time: 0.134454 s
+File: /home/miyashita21/gitrepo/3dshapes_generator/renderer_3dshapes_sim.py
+Function: forward at line 1187
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+  1187                                               def forward(
+  1188                                                   self,
+  1189                                                   shape: int | torch.Tensor,
+  1190                                                   size: float | torch.Tensor,
+  1191                                                   orientation: float | torch.Tensor,
+  1192                                                   floor_hue: float | torch.Tensor,
+  1193                                                   wall_hue: float | torch.Tensor,
+  1194                                                   object_hue: float | torch.Tensor,
+  1195                                                   return_grad: bool = False,
+  1196                                               ) -> torch.Tensor | tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+  1197         4       2376.0    594.0      0.0          kwargs = dict(
+  1198         2       1457.0    728.5      0.0              hue_v=self.hue_v,
+  1199         2       1436.0    718.0      0.0              orientation_period=self.orientation_period,
+  1200         2        321.0    160.5      0.0              shadow_strength=self.shadow_strength,
+  1201         2        335.0    167.5      0.0              ssaa_scale=self.ssaa_scale,
+  1202         2        355.0    177.5      0.0              image_size=self.image_size,
+  1203         2        523.0    261.5      0.0              lighting_config=self.lighting_config,
+  1204         2        321.0    160.5      0.0              mesh_resolution_config=self.mesh_resolution_config,
+  1205         2        276.0    138.0      0.0              camera_config=self.camera_config,
+  1206         2        335.0    167.5      0.0              room_config=self.room_config,
+  1207         2        280.0    140.0      0.0              object_config=self.object_config,
+  1208         2        243.0    121.5      0.0              output_chw=self.output_chw,
+  1209                                                   )
+  1210                                           
+  1211         2        793.0    396.5      0.0          refs = [shape, size, orientation, floor_hue, wall_hue, object_hue, self.hue_v]
+  1212         2      13564.0   6782.0      0.0          float_ref = next((x for x in refs if torch.is_tensor(x) and torch.is_floating_point(x)), None)
+  1213         2       2258.0   1129.0      0.0          any_ref = next((x for x in refs if torch.is_tensor(x)), None)
+  1214         2        429.0    214.5      0.0          t_ref = float_ref if float_ref is not None else any_ref
+  1215         2        727.0    363.5      0.0          device = t_ref.device if t_ref is not None else torch.device("cpu")
+  1216         2       1075.0    537.5      0.0          dtype = t_ref.dtype if t_ref is not None and torch.is_floating_point(t_ref) else torch.float32
+  1217                                           
+  1218         2      14315.0   7157.5      0.0          shape_b = _factor_to_1d(shape, device=device, dtype=dtype, name="shape")
+  1219         2       2970.0   1485.0      0.0          size_b = _factor_to_1d(size, device=device, dtype=dtype, name="size")
+  1220         2       2435.0   1217.5      0.0          ori_b = _factor_to_1d(orientation, device=device, dtype=dtype, name="orientation")
+  1221         2       2356.0   1178.0      0.0          floor_b = _factor_to_1d(floor_hue, device=device, dtype=dtype, name="floor_hue")
+  1222         2       2267.0   1133.5      0.0          wall_b = _factor_to_1d(wall_hue, device=device, dtype=dtype, name="wall_hue")
+  1223         2       2204.0   1102.0      0.0          obj_b = _factor_to_1d(object_hue, device=device, dtype=dtype, name="object_hue")
+  1224                                           
+  1225         2       2223.0   1111.5      0.0          lengths = [shape_b.shape[0], size_b.shape[0], ori_b.shape[0], floor_b.shape[0], wall_b.shape[0], obj_b.shape[0]]
+  1226         2       2944.0   1472.0      0.0          bsz = max(lengths)
+  1227         2        724.0    362.0      0.0          names = ["shape", "size", "orientation", "floor_hue", "wall_hue", "object_hue"]
+  1228        14       2782.0    198.7      0.0          for n, ln in zip(names, lengths):
+  1229        12       2079.0    173.2      0.0              if ln not in (1, bsz):
+  1230                                                           raise ValueError(f"{n} batch size must be 1 or {bsz}, got {ln}")
+  1231                                           
+  1232         2        551.0    275.5      0.0          def expand1(x: torch.Tensor) -> torch.Tensor:
+  1233                                                       return x if x.shape[0] == bsz else x.expand(bsz)
+  1234                                           
+  1235         2      16294.0   8147.0      0.0          shape_ids = torch.clamp(expand1(shape_b).to(torch.int64), 0, 3)
+  1236         2       1064.0    532.0      0.0          size_b = expand1(size_b)
+  1237         2        714.0    357.0      0.0          ori_b = expand1(ori_b)
+  1238         2        650.0    325.0      0.0          floor_b = expand1(floor_b)
+  1239         2        710.0    355.0      0.0          wall_b = expand1(wall_b)
+  1240         2        684.0    342.0      0.0          obj_b = expand1(obj_b)
+  1241                                           
+  1242         2        273.0    136.5      0.0          if return_grad:
+  1243                                                       jac_out: list[torch.Tensor] | None = None
+  1244                                                       img_out: torch.Tensor | None = None
+  1245                                                       for sid in range(4):
+  1246                                                           idx = torch.nonzero(shape_ids == sid, as_tuple=False).reshape(-1)
+  1247                                                           if idx.numel() == 0:
+  1248                                                               continue
+  1249                                           
+  1250                                                           def render_single_fixed_shape(
+  1251                                                               size_i: torch.Tensor,
+  1252                                                               orientation_i: torch.Tensor,
+  1253                                                               floor_hue_i: torch.Tensor,
+  1254                                                               wall_hue_i: torch.Tensor,
+  1255                                                               object_hue_i: torch.Tensor,
+  1256                                                           ):
+  1257                                                               image = render_3dshapes_image(
+  1258                                                                   shape=sid,
+  1259                                                                   size=size_i.unsqueeze(0),
+  1260                                                                   orientation=orientation_i.unsqueeze(0),
+  1261                                                                   floor_hue=floor_hue_i.unsqueeze(0),
+  1262                                                                   wall_hue=wall_hue_i.unsqueeze(0),
+  1263                                                                   object_hue=object_hue_i.unsqueeze(0),
+  1264                                                                   **kwargs,
+  1265                                                               )
+  1266                                                               return image.squeeze(0), image.squeeze(0)
+  1267                                           
+  1268                                                           renderer_with_grad = torch.func.vmap(
+  1269                                                               torch.func.jacfwd(
+  1270                                                                   render_single_fixed_shape,
+  1271                                                                   argnums=(0, 1, 2, 3, 4),
+  1272                                                                   has_aux=True,
+  1273                                                               )
+  1274                                                           )
+  1275                                                           jac_g, img_g = renderer_with_grad(size_b[idx], ori_b[idx], floor_b[idx], wall_b[idx], obj_b[idx])
+  1276                                           
+  1277                                                           if jac_out is None or img_out is None:
+  1278                                                               img_out = torch.empty((bsz,) + tuple(img_g.shape[1:]), device=img_g.device, dtype=img_g.dtype)
+  1279                                                               jac_out = [
+  1280                                                                   torch.empty((bsz,) + tuple(j.shape[1:]), device=j.device, dtype=j.dtype)
+  1281                                                                   for j in jac_g
+  1282                                                               ]
+  1283                                                           img_out[idx] = img_g
+  1284                                                           for k in range(5):
+  1285                                                               jac_out[k][idx] = jac_g[k]
+  1286                                           
+  1287                                                       if jac_out is None or img_out is None:
+  1288                                                           raise RuntimeError("No valid shape ids in input.")
+  1289                                                       return tuple(jac_out), img_out
+  1290                                           
+  1291         2        311.0    155.5      0.0          if bsz == 1:
+  1292                                                       sid = int(shape_ids[0].item())
+  1293                                                       return render_3dshapes_image(
+  1294                                                           shape=sid,
+  1295                                                           size=size_b,
+  1296                                                           orientation=ori_b,
+  1297                                                           floor_hue=floor_b,
+  1298                                                           wall_hue=wall_b,
+  1299                                                           object_hue=obj_b,
+  1300                                                           **kwargs,
+  1301                                                       )
+  1302                                           
+  1303         2        171.0     85.5      0.0          out: torch.Tensor | None = None
+  1304        10       5087.0    508.7      0.0          for sid in range(4):
+  1305         8     103027.0  12878.4      0.1              idx = torch.nonzero(shape_ids == sid, as_tuple=False).reshape(-1)
+  1306         8       5791.0    723.9      0.0              if idx.numel() == 0:
+  1307                                                           continue
+  1308        24  133976239.0 5.58e+06     99.6              out_g = render_3dshapes_image(
+  1309         8        660.0     82.5      0.0                  shape=sid,
+  1310         8      51595.0   6449.4      0.0                  size=size_b[idx],
+  1311         8      16878.0   2109.8      0.0                  orientation=ori_b[idx],
+  1312         8      13270.0   1658.8      0.0                  floor_hue=floor_b[idx],
+  1313         8      14660.0   1832.5      0.0                  wall_hue=wall_b[idx],
+  1314         8      12609.0   1576.1      0.0                  object_hue=obj_b[idx],
+  1315         8       1062.0    132.8      0.0                  **kwargs,
+  1316                                                       )
+  1317         8       2672.0    334.0      0.0              if out_g.ndim == 3:
+  1318         8      14947.0   1868.4      0.0                  out_g = out_g.unsqueeze(0)
+  1319         8       1228.0    153.5      0.0              if out is None:
+  1320         2      13101.0   6550.5      0.0                  out = torch.empty((bsz,) + tuple(out_g.shape[1:]), device=out_g.device, dtype=out_g.dtype)
+  1321         8     135252.0  16906.5      0.1              out[idx] = out_g
+  1322                                           
+  1323         2        222.0    111.0      0.0          if out is None:
+  1324                                                       raise RuntimeError("No valid shape ids in input.")
+  1325         2        190.0     95.0      0.0          return out
+
+Total time: 0.133051 s
+File: /home/miyashita21/gitrepo/3dshapes_generator/renderer_3dshapes_sim.py
+Function: render_3dshapes_image at line 917
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   917                                           def render_3dshapes_image(
+   918                                               shape: int,
+   919                                               size: float | torch.Tensor,
+   920                                               orientation: float | torch.Tensor,
+   921                                               floor_hue: float | torch.Tensor,
+   922                                               wall_hue: float | torch.Tensor,
+   923                                               object_hue: float | torch.Tensor,
+   924                                               *,
+   925                                               hue_v: float | torch.Tensor = 0.9,
+   926                                               orientation_period: float | torch.Tensor = 1.0,
+   927                                               shadow_strength: float | torch.Tensor = 10.0,
+   928                                               ssaa_scale: int = 4,
+   929                                               image_size: int | Tuple[int, int] = 64,
+   930                                               lighting_config: LightingConfig | None = None,
+   931                                               mesh_resolution_config: MeshResolutionConfig | None = None,
+   932                                               camera_config: CameraConfig | None = None,
+   933                                               room_config: RoomConfig | None = None,
+   934                                               object_config: ObjectConfig | None = None,
+   935                                               output_chw: bool = True,
+   936                                           ) -> torch.Tensor:
+   937                                               """Differentiable renderer for a fixed shape id.
+   938                                           
+   939                                               `shape` is treated as an integer (0..3). For mixed-shape batches, use
+   940                                               `render_3dshapes_image_grouped`.
+   941                                               """
+   942         8       2802.0    350.2      0.0      refs = [size, orientation, floor_hue, wall_hue, object_hue, hue_v]
+   943         8      34170.0   4271.2      0.0      float_ref = next((x for x in refs if torch.is_tensor(x) and torch.is_floating_point(x)), None)
+   944         8       9142.0   1142.8      0.0      any_ref = next((x for x in refs if torch.is_tensor(x)), None)
+   945         8       1243.0    155.4      0.0      t_ref = float_ref if float_ref is not None else any_ref
+   946         8       2643.0    330.4      0.0      device = t_ref.device if t_ref is not None else torch.device("cpu")
+   947         8       3772.0    471.5      0.0      dtype = t_ref.dtype if t_ref is not None and torch.is_floating_point(t_ref) else torch.float32
+   948         8      19180.0   2397.5      0.0      dkey = _device_cache_key(device)
+   949                                           
+   950         8      19128.0   2391.0      0.0      size_b = _factor_to_1d(size, device=device, dtype=dtype, name="size")
+   951         8       9657.0   1207.1      0.0      ori_b = _factor_to_1d(orientation, device=device, dtype=dtype, name="orientation")
+   952         8       8736.0   1092.0      0.0      floor_b = _factor_to_1d(floor_hue, device=device, dtype=dtype, name="floor_hue")
+   953         8       8641.0   1080.1      0.0      wall_b = _factor_to_1d(wall_hue, device=device, dtype=dtype, name="wall_hue")
+   954         8       8560.0   1070.0      0.0      obj_b = _factor_to_1d(object_hue, device=device, dtype=dtype, name="object_hue")
+   955                                           
+   956         8       6643.0    830.4      0.0      lengths = [size_b.shape[0], ori_b.shape[0], floor_b.shape[0], wall_b.shape[0], obj_b.shape[0]]
+   957         8       7863.0    982.9      0.0      bsz = max(lengths)
+   958         8       2514.0    314.2      0.0      names = ["size", "orientation", "floor_hue", "wall_hue", "object_hue"]
+   959        48       8231.0    171.5      0.0      for n, ln in zip(names, lengths):
+   960        40       6052.0    151.3      0.0          if ln not in (1, bsz):
+   961                                                       raise ValueError(f"{n} batch size must be 1 or {bsz}, got {ln}")
+   962                                           
+   963         8       1948.0    243.5      0.0      def expand1(x: torch.Tensor) -> torch.Tensor:
+   964                                                   return x if x.shape[0] == bsz else x.expand(bsz)
+   965                                           
+   966         8      24816.0   3102.0      0.0      size_b = expand1(size_b).clamp(0.4, 1.8)
+   967         8       3374.0    421.8      0.0      ori_b = expand1(ori_b)
+   968         8       2704.0    338.0      0.0      floor_b = expand1(floor_b)
+   969         8       2636.0    329.5      0.0      wall_b = expand1(wall_b)
+   970         8       2596.0    324.5      0.0      obj_b = expand1(obj_b)
+   971         8       7920.0    990.0      0.0      sid = max(0, min(3, int(shape)))
+   972                                           
+   973         8       1582.0    197.8      0.0      lighting_config = lighting_config or DEFAULT_LIGHTING_CONFIG
+   974         8       1261.0    157.6      0.0      mesh_resolution_config = mesh_resolution_config or DEFAULT_MESH_RESOLUTION_CONFIG
+   975         8        767.0     95.9      0.0      camera_config = camera_config or DEFAULT_CAMERA_CONFIG
+   976         8        666.0     83.2      0.0      room_config = room_config or DEFAULT_ROOM_CONFIG
+   977         8        646.0     80.8      0.0      object_config = object_config or DEFAULT_OBJECT_CONFIG
+   978                                           
+   979         8      59140.0   7392.5      0.0      orientation_period_t = _as_torch_scalar(orientation_period, device, dtype)
+   980         8       8610.0   1076.2      0.0      period_eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1e-8)
+   981        16      12963.0    810.2      0.0      orientation_period_safe = torch.where(
+   982         8      35836.0   4479.5      0.0          torch.abs(orientation_period_t) > period_eps,
+   983         8       1002.0    125.2      0.0          orientation_period_t,
+   984         8      62300.0   7787.5      0.0          torch.where(orientation_period_t >= 0.0, period_eps, -period_eps),
+   985                                               )
+   986         8      26354.0   3294.2      0.0      yaw_offset_deg_t = _as_torch_scalar(camera_config.yaw_offset_deg, device, dtype)
+   987        16     109117.0   6819.8      0.1      theta = 2.0 * torch.pi * torch.remainder(ori_b / orientation_period_safe, 1.0) + (
+   988         8      19010.0   2376.2      0.0          yaw_offset_deg_t * (torch.pi / 180.0)
+   989                                               )
+   990                                           
+   991         8       4432.0    554.0      0.0      ssaa_scale = int(max(1, ssaa_scale))
+   992         8      12758.0   1594.8      0.0      h0, w0 = _parse_image_size(image_size)
+   993         8       1503.0    187.9      0.0      h = h0 * ssaa_scale
+   994         8        744.0     93.0      0.0      w = w0 * ssaa_scale
+   995         8       7087.0    885.9      0.0      dx, dy = _cached_image_plane(h, w, dkey[0], dkey[1], dtype)
+   996                                           
+   997         8      25042.0   3130.2      0.0      cam_radius = _as_torch_scalar(camera_config.radius, device, dtype)
+   998         8      19119.0   2389.9      0.0      cam_height = _as_torch_scalar(camera_config.height, device, dtype)
+   999         8      44199.0   5524.9      0.0      target = _as_torch_vec3(camera_config.target, device, dtype)
+  1000        16      43896.0   2743.5      0.0      cam_pos = torch.stack(
+  1001         8       1089.0    136.1      0.0          [
+  1002         8      42048.0   5256.0      0.0              cam_radius * torch.sin(theta),
+  1003         8      24397.0   3049.6      0.0              torch.full_like(theta, cam_height),
+  1004         8      35075.0   4384.4      0.0              cam_radius * torch.cos(theta),
+  1005                                                   ],
+  1006         8        655.0     81.9      0.0          dim=-1,
+  1007                                               )
+  1008                                           
+  1009         8      40487.0   5060.9      0.0      forward = target[None, :] - cam_pos
+  1010         8      55034.0   6879.2      0.0      forward = forward / torch.clamp(torch.linalg.norm(forward, dim=-1, keepdim=True), min=1e-8)
+  1011         8      32291.0   4036.4      0.0      up_hint = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 1.0, 0.0).expand(bsz, 3)
+  1012         8      37907.0   4738.4      0.0      right = torch.cross(forward, up_hint, dim=-1)
+  1013         8      32141.0   4017.6      0.0      right = right / torch.clamp(torch.linalg.norm(right, dim=-1, keepdim=True), min=1e-8)
+  1014         8      10414.0   1301.8      0.0      up = torch.cross(right, forward, dim=-1)
+  1015         8      28475.0   3559.4      0.0      up = up / torch.clamp(torch.linalg.norm(up, dim=-1, keepdim=True), min=1e-8)
+  1016                                           
+  1017         8        729.0     91.1      0.0      ray_dir = (
+  1018        24    1118795.0  46616.5      0.8          right[:, None, None, :] * dx[None, :, :, None]
+  1019         8     662309.0  82788.6      0.5          + up[:, None, None, :] * dy[None, :, :, None]
+  1020         8      22037.0   2754.6      0.0          + forward[:, None, None, :]
+  1021                                               )
+  1022         8     983907.0 122988.4      0.7      ray_dir = ray_dir / torch.clamp(torch.linalg.norm(ray_dir, dim=-1, keepdim=True), min=1e-8)
+  1023                                           
+  1024         8      39471.0   4933.9      0.0      hue_v_t = _as_torch_scalar(hue_v, device, dtype).clamp(0.0, 1.0)
+  1025         8     494435.0  61804.4      0.4      floor_rgb = _hue_to_rgb_constrained(floor_b, hue_v_t)
+  1026         8     376116.0  47014.5      0.3      wall_rgb = _hue_to_rgb_constrained(wall_b, hue_v_t)
+  1027         8     348830.0  43603.8      0.3      obj_rgb = _hue_to_rgb_constrained(obj_b, hue_v_t)
+  1028                                           
+  1029         8      50567.0   6320.9      0.0      light_base = _as_torch_vec3(lighting_config.light_position_world, device, dtype)
+  1030         8       7924.0    990.5      0.0      c = torch.cos(theta)
+  1031         8       8132.0   1016.5      0.0      s = torch.sin(theta)
+  1032         8      15650.0   1956.2      0.0      z = torch.zeros_like(c)
+  1033         8      12630.0   1578.8      0.0      o = torch.ones_like(c)
+  1034        16      23874.0   1492.1      0.0      rot = torch.stack(
+  1035         8        803.0    100.4      0.0          [
+  1036         8      21344.0   2668.0      0.0              torch.stack([c, z, s], dim=-1),
+  1037         8      15438.0   1929.8      0.0              torch.stack([z, o, z], dim=-1),
+  1038         8      28401.0   3550.1      0.0              torch.stack([-s, z, c], dim=-1),
+  1039                                                   ],
+  1040         8        626.0     78.2      0.0          dim=1,
+  1041                                               )
+  1042         8      85899.0  10737.4      0.1      light_pos_world = rot @ light_base
+  1043         8      37821.0   4727.6      0.0      ambient = _as_torch_scalar(lighting_config.ambient, device, dtype).clamp(0.0, 1.0)
+  1044         8      30656.0   3832.0      0.0      diffuse = _as_torch_scalar(lighting_config.diffuse, device, dtype).clamp(0.0, 2.0)
+  1045         8      29659.0   3707.4      0.0      shadow_s = _as_torch_scalar(shadow_strength, device, dtype).clamp(0.0, 1.0)
+  1046         8      19399.0   2424.9      0.0      room_y0 = _as_torch_scalar(room_config.floor_y, device, dtype)
+  1047         8      20764.0   2595.5      0.0      room_y1 = _as_torch_scalar(room_config.wall_top_y, device, dtype)
+  1048         8      19774.0   2471.8      0.0      half_w = _as_torch_scalar(room_config.half_width, device, dtype)
+  1049         8      20451.0   2556.4      0.0      half_d = _as_torch_scalar(room_config.half_depth, device, dtype)
+  1050         8       8642.0   1080.2      0.0      room_x0, room_x1 = -half_w, half_w
+  1051         8       6196.0    774.5      0.0      room_z0, room_z1 = -half_d, half_d
+  1052         8       1666.0    208.2      0.0      room_bounds = (room_y0, room_y1, room_x0, room_x1, room_z0, room_z1)
+  1053         8       3440.0    430.0      0.0      room_eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1e-8)
+  1054         8       4505.0    563.1      0.0      room_sky = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.72, 0.88, 1.0)
+  1055         8       1071.0    133.9      0.0      room_normals = (
+  1056         8       2927.0    365.9      0.0          _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 1.0, 0.0),
+  1057         8       2353.0    294.1      0.0          _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 0.0, 1.0),
+  1058         8       2343.0    292.9      0.0          _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 0.0, -1.0),
+  1059         8       2246.0    280.8      0.0          _cached_vec3_tensor(dkey[0], dkey[1], dtype, 1.0, 0.0, 0.0),
+  1060         8       2265.0    283.1      0.0          _cached_vec3_tensor(dkey[0], dkey[1], dtype, -1.0, 0.0, 0.0),
+  1061                                               )
+  1062                                           
+  1063        16       8147.0    509.2      0.0      meshes = _get_meshes(
+  1064         8       2951.0    368.9      0.0          cylinder_radial_steps=mesh_resolution_config.cylinder_radial_steps,
+  1065         8       1290.0    161.2      0.0          sphere_lat_steps=mesh_resolution_config.sphere_lat_steps,
+  1066         8       1158.0    144.8      0.0          sphere_lon_steps=mesh_resolution_config.sphere_lon_steps,
+  1067         8       1259.0    157.4      0.0          capsule_radial_steps=mesh_resolution_config.capsule_radial_steps,
+  1068         8        900.0    112.5      0.0          capsule_hemi_steps=mesh_resolution_config.capsule_hemi_steps,
+  1069                                               )
+  1070                                           
+  1071         8       3104.0    388.0      0.0      mesh = meshes[sid]
+  1072         8      43503.0   5437.9      0.0      base_scale = _as_torch_shape_vec3(object_config.base_scales, sid, device, dtype)
+  1073         8      35349.0   4418.6      0.0      base_scale = base_scale * _as_torch_scalar(object_config.global_scale_multiplier, device, dtype)
+  1074         8      42222.0   5277.8      0.0      scale_g = base_scale[None, :] * size_b[:, None]
+  1075                                           
+  1076         8     246023.0  30752.9      0.2      extent_y = _cached_scalar_tensor(dkey[0], dkey[1], dtype, float(np.max(np.abs(mesh.verts[:, 1]))))
+  1077         8       2156.0    269.5      0.0      if object_config.use_auto_grounding:
+  1078         8      26970.0   3371.2      0.0          clearance = _as_torch_shape_scalar(object_config.ground_clearance_by_shape, sid, device, dtype)
+  1079         8      57460.0   7182.5      0.0          center_y = room_y0 + clearance + extent_y * scale_g[:, 1]
+  1080                                               else:
+  1081                                                   center_y = _as_torch_shape_scalar(object_config.center_y_by_shape, sid, device, dtype).expand(bsz)
+  1082        16      27979.0   1748.7      0.0      center_world_g = torch.stack(
+  1083         8        877.0    109.6      0.0          [
+  1084         8      33283.0   4160.4      0.0              _as_torch_scalar(object_config.center_x, device, dtype).expand(bsz),
+  1085         8        685.0     85.6      0.0              center_y,
+  1086         8      26568.0   3321.0      0.0              _as_torch_scalar(object_config.center_z, device, dtype).expand(bsz),
+  1087                                                   ],
+  1088         8        655.0     81.9      0.0          dim=-1,
+  1089                                               )
+  1090                                           
+  1091        16   45956505.0 2.87e+06     34.5      room_color, room_depth, floor_mask, floor_pts = _render_room(
+  1092         8        589.0     73.6      0.0          cam_pos=cam_pos,
+  1093         8        502.0     62.8      0.0          ray_dir=ray_dir,
+  1094         8        399.0     49.9      0.0          room_config=room_config,
+  1095         8        369.0     46.1      0.0          floor_rgb=floor_rgb,
+  1096         8        873.0    109.1      0.0          wall_rgb=wall_rgb,
+  1097         8        543.0     67.9      0.0          light_pos_world=light_pos_world,
+  1098         8        439.0     54.9      0.0          ambient=ambient,
+  1099         8        383.0     47.9      0.0          diffuse=diffuse,
+  1100         8        479.0     59.9      0.0          room_bounds=room_bounds,
+  1101         8        373.0     46.6      0.0          plane_normals=room_normals,
+  1102         8        411.0     51.4      0.0          eps=room_eps,
+  1103         8        373.0     46.6      0.0          sky=room_sky,
+  1104                                               )
+  1105                                           
+  1106        16   42107515.0 2.63e+06     31.6      vis = _soft_shadow_floor(
+  1107         8        639.0     79.9      0.0          floor_points=floor_pts,
+  1108         8        534.0     66.8      0.0          floor_mask=floor_mask,
+  1109         8        482.0     60.2      0.0          light_pos_world=light_pos_world,
+  1110         8        528.0     66.0      0.0          shape_id=sid,
+  1111         8        362.0     45.2      0.0          center_world=center_world_g,
+  1112         8        406.0     50.8      0.0          scale_xyz=scale_g,
+  1113         8        684.0     85.5      0.0          n_samples=24,
+  1114         8        457.0     57.1      0.0          sigma=0.03,
+  1115                                               )
+  1116         8     511628.0  63953.5      0.4      l = light_pos_world[:, None, None, :] - floor_pts
+  1117         8     992913.0 124114.1      0.7      l = l / torch.clamp(torch.linalg.norm(l, dim=-1, keepdim=True), min=1e-8)
+  1118         8     209418.0  26177.2      0.2      ndotl = torch.clamp(l[..., 1], min=0.0)
+  1119         8     399835.0  49979.4      0.3      lit = ambient + diffuse * ndotl * (1.0 - shadow_s * (1.0 - vis))
+  1120         8     879978.0 109997.2      0.7      floor_shaded = torch.clamp(floor_rgb[:, None, None, :] * lit[..., None], 0.0, 1.0)
+  1121         8     748084.0  93510.5      0.6      room_color = torch.where(floor_mask[..., None], floor_shaded, room_color)
+  1122                                           
+  1123        16   12198916.0 762432.2      9.2      hit_obj, t_obj = _ray_march_object(
+  1124         8       1160.0    145.0      0.0          cam_pos=cam_pos,
+  1125         8        575.0     71.9      0.0          ray_dir=ray_dir,
+  1126         8        634.0     79.2      0.0          shape_id=sid,
+  1127         8        501.0     62.6      0.0          center_world=center_world_g,
+  1128         8        466.0     58.2      0.0          scale_xyz=scale_g,
+  1129                                               )
+  1130         8    1011841.0 126480.1      0.8      p_obj = cam_pos[:, None, None, :] + ray_dir * t_obj[..., None]
+  1131        16   17421739.0 1.09e+06     13.1      n_obj = _normal_from_sdf(
+  1132         8        546.0     68.2      0.0          p_obj,
+  1133         8        460.0     57.5      0.0          sid,
+  1134         8      22561.0   2820.1      0.0          center_world_g[:, None, None, :],
+  1135         8      20106.0   2513.2      0.0          scale_g[:, None, None, :],
+  1136                                               )
+  1137         8     655028.0  81878.5      0.5      l_obj = light_pos_world[:, None, None, :] - p_obj
+  1138         8    1012280.0 126535.0      0.8      l_obj = l_obj / torch.clamp(torch.linalg.norm(l_obj, dim=-1, keepdim=True), min=1e-8)
+  1139         8     535737.0  66967.1      0.4      ndotl_obj = torch.clamp(torch.sum(n_obj * l_obj, dim=-1), min=0.0)
+  1140         8     116222.0  14527.8      0.1      obj_lit = ambient + diffuse * ndotl_obj
+  1141         8     668223.0  83527.9      0.5      obj_color = torch.clamp(obj_rgb[:, None, None, :] * obj_lit[..., None], 0.0, 1.0)
+  1142         8     199266.0  24908.2      0.1      obj_front = hit_obj & (t_obj < room_depth)
+  1143         8     738381.0  92297.6      0.6      out = torch.where(obj_front[..., None], obj_color, room_color)
+  1144                                           
+  1145         8       1522.0    190.2      0.0      if ssaa_scale > 1:
+  1146         8     461387.0  57673.4      0.3          out = _downsample_mean(out, ssaa_scale)
+  1147         8        827.0    103.4      0.0      if output_chw:
+  1148         8      12175.0   1521.9      0.0          out = out.permute(0, 3, 1, 2)
+  1149         8       1375.0    171.9      0.0      if bsz == 1:
+  1150         8      14086.0   1760.8      0.0          return out[0]
+  1151                                               return out
+
+Total time: 0.0458996 s
+File: /home/miyashita21/gitrepo/3dshapes_generator/renderer_3dshapes_sim.py
+Function: _render_room at line 736
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   736                                           def _render_room(
+   737                                               cam_pos: torch.Tensor,
+   738                                               ray_dir: torch.Tensor,
+   739                                               room_config: RoomConfig,
+   740                                               floor_rgb: torch.Tensor,
+   741                                               wall_rgb: torch.Tensor,
+   742                                               light_pos_world: torch.Tensor,
+   743                                               ambient: torch.Tensor,
+   744                                               diffuse: torch.Tensor,
+   745                                               room_bounds: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+   746                                               plane_normals: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+   747                                               eps: torch.Tensor | None = None,
+   748                                               sky: torch.Tensor | None = None,
+   749                                           ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+   750         8       6287.0    785.9      0.0      b, h, w, _ = ray_dir.shape
+   751         8       1397.0    174.6      0.0      dtype = ray_dir.dtype
+   752         8       1569.0    196.1      0.0      device = ray_dir.device
+   753                                           
+   754         8       1182.0    147.8      0.0      if room_bounds is None:
+   755                                                   y0 = _as_torch_scalar(room_config.floor_y, device, dtype)
+   756                                                   y1 = _as_torch_scalar(room_config.wall_top_y, device, dtype)
+   757                                                   half_w = _as_torch_scalar(room_config.half_width, device, dtype)
+   758                                                   half_d = _as_torch_scalar(room_config.half_depth, device, dtype)
+   759                                                   x0, x1 = -half_w, half_w
+   760                                                   z0, z1 = -half_d, half_d
+   761                                               else:
+   762         8       1341.0    167.6      0.0          y0, y1, x0, x1, z0, z1 = room_bounds
+   763                                           
+   764         8        810.0    101.2      0.0      if sky is None:
+   765                                                   dkey = _device_cache_key(device)
+   766                                                   sky = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.72, 0.88, 1.0)
+   767         8     413968.0  51746.0      0.9      color = sky[None, None, None, :].expand(b, h, w, 3).clone()
+   768         8      82470.0  10308.8      0.2      depth = torch.full((b, h, w), float("inf"), device=device, dtype=dtype)
+   769         8      98596.0  12324.5      0.2      surface_id = torch.full((b, h, w), -1, device=device, dtype=torch.int64)
+   770         8     103133.0  12891.6      0.2      hit_points = torch.zeros((b, h, w, 3), device=device, dtype=dtype)
+   771         8       1200.0    150.0      0.0      if eps is None:
+   772                                                   dkey = _device_cache_key(device)
+   773                                                   eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1e-8)
+   774         8       1016.0    127.0      0.0      if plane_normals is None:
+   775                                                   dkey = _device_cache_key(device)
+   776                                                   n_floor = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 1.0, 0.0)
+   777                                                   n_back = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 0.0, 1.0)
+   778                                                   n_front = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 0.0, -1.0)
+   779                                                   n_left = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 1.0, 0.0, 0.0)
+   780                                                   n_right = _cached_vec3_tensor(dkey[0], dkey[1], dtype, -1.0, 0.0, 0.0)
+   781                                               else:
+   782         8       1196.0    149.5      0.0          n_floor, n_back, n_front, n_left, n_right = plane_normals
+   783                                           
+   784         8       2757.0    344.6      0.0      def safe_div(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
+   785                                                   den_safe = torch.where(torch.abs(den) > eps, den, torch.where(den >= 0.0, eps, -eps))
+   786                                                   return num / den_safe
+   787                                           
+   788         8       2621.0    327.6      0.0      def plane_update(
+   789                                                   t: torch.Tensor,
+   790                                                   p: torch.Tensor,
+   791                                                   valid: torch.Tensor,
+   792                                                   normal: torch.Tensor,
+   793                                                   base_rgb: torch.Tensor,
+   794                                                   surf_id: int,
+   795                                               ) -> None:
+   796                                                   nonlocal color, depth, surface_id, hit_points
+   797                                                   l = light_pos_world[:, None, None, :] - p
+   798                                                   l = l / torch.clamp(torch.linalg.norm(l, dim=-1, keepdim=True), min=1e-8)
+   799                                                   ndotl = torch.clamp(torch.sum(l * normal[None, None, None, :], dim=-1), min=0.0)
+   800                                                   lit = ambient + diffuse * ndotl
+   801                                                   c = torch.clamp(base_rgb[:, None, None, :] * lit[..., None], 0.0, 1.0)
+   802                                                   closer = valid & (t > 1e-6) & (t < depth)
+   803                                                   depth = torch.where(closer, t, depth)
+   804                                                   color = torch.where(closer[..., None], c, color)
+   805                                                   surf_id_t = torch.tensor(surf_id, device=device, dtype=surface_id.dtype)
+   806                                                   surface_id = torch.where(closer, surf_id_t, surface_id)
+   807                                                   hit_points = torch.where(closer[..., None], p, hit_points)
+   808                                           
+   809                                               # floor
+   810         8      13290.0   1661.2      0.0      den = ray_dir[..., 1]
+   811         8    1165847.0 145730.9      2.5      t = safe_div(y0 - cam_pos[:, None, None, 1], den)
+   812         8    1066965.0 133370.6      2.3      p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
+   813         8    1186680.0 148335.0      2.6      valid = (torch.abs(den) > 1e-8) & (p[..., 0] >= x0) & (p[..., 0] <= x1) & (p[..., 2] >= z0) & (p[..., 2] <= z1)
+   814         8    5562867.0 695358.4     12.1      plane_update(t, p, valid, n_floor, floor_rgb, surf_id=0)
+   815                                           
+   816         8       3274.0    409.2      0.0      if room_config.draw_back_wall:
+   817         8      13669.0   1708.6      0.0          den = ray_dir[..., 2]
+   818         8    1140991.0 142623.9      2.5          t = safe_div(z0 - cam_pos[:, None, None, 2], den)
+   819         8    1000668.0 125083.5      2.2          p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
+   820         8    1222303.0 152787.9      2.7          valid = (torch.abs(den) > 1e-8) & (p[..., 0] >= x0) & (p[..., 0] <= x1) & (p[..., 1] >= y0) & (p[..., 1] <= y1)
+   821         8    5686410.0 710801.2     12.4          plane_update(t, p, valid, n_back, wall_rgb, surf_id=1)
+   822         8       2531.0    316.4      0.0      if room_config.draw_front_wall:
+   823         8      13161.0   1645.1      0.0          den = ray_dir[..., 2]
+   824         8    1131173.0 141396.6      2.5          t = safe_div(z1 - cam_pos[:, None, None, 2], den)
+   825         8    1024346.0 128043.2      2.2          p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
+   826         8    1149495.0 143686.9      2.5          valid = (torch.abs(den) > 1e-8) & (p[..., 0] >= x0) & (p[..., 0] <= x1) & (p[..., 1] >= y0) & (p[..., 1] <= y1)
+   827         8    5682940.0 710367.5     12.4          plane_update(t, p, valid, n_front, wall_rgb, surf_id=2)
+   828         8       2347.0    293.4      0.0      if room_config.draw_left_wall:
+   829         8      12728.0   1591.0      0.0          den = ray_dir[..., 0]
+   830         8    1131017.0 141377.1      2.5          t = safe_div(x0 - cam_pos[:, None, None, 0], den)
+   831         8    1030936.0 128867.0      2.2          p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
+   832         8    1151629.0 143953.6      2.5          valid = (torch.abs(den) > 1e-8) & (p[..., 2] >= z0) & (p[..., 2] <= z1) & (p[..., 1] >= y0) & (p[..., 1] <= y1)
+   833         8    5634502.0 704312.8     12.3          plane_update(t, p, valid, n_left, wall_rgb, surf_id=3)
+   834         8       2134.0    266.8      0.0      if room_config.draw_right_wall:
+   835         8      12816.0   1602.0      0.0          den = ray_dir[..., 0]
+   836         8    1130105.0 141263.1      2.5          t = safe_div(x1 - cam_pos[:, None, None, 0], den)
+   837         8    1026753.0 128344.1      2.2          p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
+   838         8    1145711.0 143213.9      2.5          valid = (torch.abs(den) > 1e-8) & (p[..., 2] >= z0) & (p[..., 2] <= z1) & (p[..., 1] >= y0) & (p[..., 1] <= y1)
+   839         8    5663244.0 707905.5     12.3          plane_update(t, p, valid, n_right, wall_rgb, surf_id=4)
+   840                                           
+   841         8     168123.0  21015.4      0.4      floor_mask = surface_id == 0
+   842         8       1355.0    169.4      0.0      return color, depth, floor_mask, hit_points
+
+Total time: 0.0410239 s
+File: /home/miyashita21/gitrepo/3dshapes_generator/renderer_3dshapes_sim.py
+Function: _soft_shadow_floor at line 845
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   845                                           def _soft_shadow_floor(
+   846                                               floor_points: torch.Tensor,  # (B,H,W,3)
+   847                                               floor_mask: torch.Tensor,    # (B,H,W)
+   848                                               light_pos_world: torch.Tensor,
+   849                                               shape_id: int,
+   850                                               center_world: torch.Tensor,
+   851                                               scale_xyz: torch.Tensor,
+   852                                               n_samples: int = 24,
+   853                                               sigma: float = 0.02,
+   854                                           ) -> torch.Tensor:
+   855         8       8841.0   1105.1      0.0      if floor_points.numel() == 0:
+   856                                                   return torch.empty(floor_mask.shape, device=floor_points.device, dtype=floor_points.dtype)
+   857         8        742.0     92.8      0.0      _ = n_samples
+   858         8     452671.0  56583.9      1.1      ray = light_pos_world[:, None, None, :] - floor_points
+   859         8     417744.0  52218.0      1.0      dist = torch.linalg.norm(ray, dim=-1)
+   860         8     698703.0  87337.9      1.7      ray_dir = ray / torch.clamp(dist[..., None], min=1e-8)
+   861         8      22467.0   2808.4      0.1      center_world_b = center_world[:, None, None, :]
+   862         8      19852.0   2481.5      0.0      scale_xyz_b = scale_xyz[:, None, None, :]
+   863        16   31927608.0    2e+06     77.8      t_hit = _ray_object_first_hit_t(
+   864         8        583.0     72.9      0.0          ray_origin_world=floor_points,
+   865         8        597.0     74.6      0.0          ray_dir_world=ray_dir,
+   866         8        496.0     62.0      0.0          shape_id=shape_id,
+   867         8        593.0     74.1      0.0          center_world=center_world_b,
+   868         8        504.0     63.0      0.0          scale_xyz=scale_xyz_b,
+   869         8        607.0     75.9      0.0          t_far=100.0,
+   870         8        753.0     94.1      0.0          t_min=1e-6,
+   871         8       8620.0   1077.5      0.0          softmin_tau=max(float(sigma), 1e-4),
+   872                                               )
+   873                                           
+   874                                               # Smooth window: only intersections between 4% and 96% of light segment occlude.
+   875         8     100661.0  12582.6      0.2      start_t = 0.04 * dist
+   876         8      70335.0   8791.9      0.2      end_t = 0.96 * dist
+   877         8      56001.0   7000.1      0.1      sigma_t = torch.clamp(torch.as_tensor(sigma, device=dist.device, dtype=dist.dtype), min=1e-6)
+   878         8    2295403.0 286925.4      5.6      occ_exit = torch.sigmoid((end_t - t_hit) / sigma_t)
+   879                                           
+   880                                               # Fill the "donut" artifact: when first hit is before start_t, the segment can still
+   881                                               # be inside the object at start_t and should cast shadow.
+   882         8     739370.0  92421.2      1.8      p_start = floor_points + ray_dir * start_t[..., None]
+   883         8      22285.0   2785.6      0.1      scale_min = torch.min(scale_xyz_b)
+   884        16    2375947.0 148496.7      5.8      d_start = _sdf_object_world(
+   885         8        586.0     73.2      0.0          p_start,
+   886         8        662.0     82.8      0.0          shape_id,
+   887         8        478.0     59.8      0.0          center_world_b,
+   888         8        478.0     59.8      0.0          scale_xyz_b,
+   889         8        380.0     47.5      0.0          scale_min=scale_min,
+   890                                               )
+   891                                               # Continuous inside weight (no hard branch) to preserve gradients near contact.
+   892         8    1029356.0 128669.5      2.5      inside_w = torch.sigmoid((-d_start) / sigma_t)
+   893                                               # Smooth union of hit-based occlusion and start-inside occlusion.
+   894         8     367859.0  45982.4      0.9      occ = 1.0 - (1.0 - occ_exit) * (1.0 - inside_w)
+   895         8      60917.0   7614.6      0.1      vis = 1.0 - occ
+   896         8      60633.0   7579.1      0.1      vis = torch.clamp(vis, 0.0, 1.0)
+   897         8     281190.0  35148.8      0.7      return torch.where(floor_mask, vis, torch.ones_like(vis))
+
+Total time: 0.0121769 s
+File: /home/miyashita21/gitrepo/3dshapes_generator/renderer_3dshapes_sim.py
+Function: _ray_march_object at line 525
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   525                                           def _ray_march_object(
+   526                                               cam_pos: torch.Tensor,
+   527                                               ray_dir: torch.Tensor,
+   528                                               shape_id: int,
+   529                                               center_world: torch.Tensor,
+   530                                               scale_xyz: torch.Tensor,
+   531                                               max_steps: int = 80,
+   532                                               eps: float = 1e-3,
+   533                                               t_far: float = 100.0,
+   534                                           ) -> Tuple[torch.Tensor, torch.Tensor]:
+   535                                               # Kept for backward-compatible signature; intersection is now analytic.
+   536         8       1472.0    184.0      0.0      _ = max_steps, eps
+   537         8      23122.0   2890.2      0.2      ray_origin = cam_pos[:, None, None, :]
+   538        16   11391984.0 711999.0     93.6      t_hit = _ray_object_first_hit_t(
+   539         8        497.0     62.1      0.0          ray_origin_world=ray_origin,
+   540         8        415.0     51.9      0.0          ray_dir_world=ray_dir,
+   541         8        408.0     51.0      0.0          shape_id=shape_id,
+   542         8      20138.0   2517.2      0.2          center_world=center_world[:, None, None, :],
+   543         8      20337.0   2542.1      0.2          scale_xyz=scale_xyz[:, None, None, :],
+   544         8        499.0     62.4      0.0          t_far=t_far,
+   545                                               )
+   546         8     477849.0  59731.1      3.9      hit = torch.isfinite(t_hit)
+   547         8     238971.0  29871.4      2.0      t_out = torch.where(hit, t_hit, torch.full_like(t_hit, float(t_far)))
+   548         8       1237.0    154.6      0.0      return hit, t_out
+
+Total time: 0.0173844 s
+File: /home/miyashita21/gitrepo/3dshapes_generator/renderer_3dshapes_sim.py
+Function: _normal_from_sdf at line 709
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   709                                           def _normal_from_sdf(
+   710                                               p_world: torch.Tensor,
+   711                                               shape_id: int,
+   712                                               center_world: torch.Tensor,
+   713                                               scale_xyz: torch.Tensor,
+   714                                               eps: float = 1e-3,
+   715                                           ) -> torch.Tensor:
+   716         8      55536.0   6942.0      0.3      ex = torch.zeros((1,) * (p_world.ndim - 1) + (3,), device=p_world.device, dtype=p_world.dtype)
+   717         8      16903.0   2112.9      0.1      ey = torch.zeros_like(ex)
+   718         8       6774.0    846.8      0.0      ez = torch.zeros_like(ex)
+   719         8      51539.0   6442.4      0.3      ex[..., 0] = eps
+   720         8      14852.0   1856.5      0.1      ey[..., 1] = eps
+   721         8      11910.0   1488.8      0.1      ez[..., 2] = eps
+   722         8      12962.0   1620.2      0.1      scale_min = torch.min(scale_xyz)
+   723        16    4997770.0 312360.6     28.7      nx = _sdf_object_world(p_world + ex, shape_id, center_world, scale_xyz, scale_min=scale_min) - _sdf_object_world(
+   724         8     403148.0  50393.5      2.3          p_world - ex, shape_id, center_world, scale_xyz, scale_min=scale_min
+   725                                               )
+   726        16    4770041.0 298127.6     27.4      ny = _sdf_object_world(p_world + ey, shape_id, center_world, scale_xyz, scale_min=scale_min) - _sdf_object_world(
+   727         8     391617.0  48952.1      2.3          p_world - ey, shape_id, center_world, scale_xyz, scale_min=scale_min
+   728                                               )
+   729        16    4745873.0 296617.1     27.3      nz = _sdf_object_world(p_world + ez, shape_id, center_world, scale_xyz, scale_min=scale_min) - _sdf_object_world(
+   730         8     379999.0  47499.9      2.2          p_world - ez, shape_id, center_world, scale_xyz, scale_min=scale_min
+   731                                               )
+   732         8     530771.0  66346.4      3.1      n = torch.stack([nx, ny, nz], dim=-1)
+   733         8     994700.0 124337.5      5.7      return n / torch.clamp(torch.linalg.norm(n, dim=-1, keepdim=True), min=1e-8)
+
+Total time: 0.0153493 s
+File: /home/miyashita21/gitrepo/3dshapes_generator/renderer_3dshapes_sim.py
+Function: _sdf_object_world at line 491
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   491                                           def _sdf_object_world(
+   492                                               p_world: torch.Tensor,
+   493                                               shape_id: int,
+   494                                               center_world: torch.Tensor,
+   495                                               scale_xyz: torch.Tensor,
+   496                                               scale_min: torch.Tensor | None = None,
+   497                                           ) -> torch.Tensor:
+   498        56    6037435.0 107811.3     39.3      p_local = (p_world - center_world) / scale_xyz
+   499        56     177953.0   3177.7      1.2      px, py, pz = p_local[..., 0], p_local[..., 1], p_local[..., 2]
+   500                                           
+   501        56       8244.0    147.2      0.1      if shape_id == 0:
+   502        14     445625.0  31830.4      2.9          q = torch.abs(p_local) - 1.0
+   503        14     895595.0  63971.1      5.8          outside = torch.linalg.norm(torch.clamp(q, min=0.0), dim=-1)
+   504        14     564813.0  40343.8      3.7          inside = torch.clamp(torch.max(q, dim=-1).values, max=0.0)
+   505        14     140837.0  10059.8      0.9          d_local = outside + inside
+   506        42       5089.0    121.2      0.0      elif shape_id == 1:
+   507        14    2031697.0 145121.2     13.2          d = torch.stack([torch.sqrt(px * px + pz * pz) - 1.0, torch.abs(py) - 1.0], dim=-1)
+   508        14    1312191.0  93727.9      8.5          outside = torch.linalg.norm(torch.clamp(d, min=0.0), dim=-1)
+   509        14     508649.0  36332.1      3.3          inside = torch.clamp(torch.max(d, dim=-1).values, max=0.0)
+   510        14     131630.0   9402.1      0.9          d_local = outside + inside
+   511        28       2827.0    101.0      0.0      elif shape_id == 2:
+   512        14     886368.0  63312.0      5.8          d_local = torch.linalg.norm(p_local, dim=-1) - 1.0
+   513                                               else:
+   514                                                   # Capsule: segment from y=-1 to y=+1 with radius 1.
+   515        14     340568.0  24326.3      2.2          cy = torch.clamp(py, -1.0, 1.0)
+   516                                                   # Equivalent to norm(p_local - [0, cy, 0]) but avoids allocating a stacked tensor.
+   517        14     289447.0  20674.8      1.9          dy = py - cy
+   518        14    1176027.0  84001.9      7.7          d_local = torch.sqrt(px * px + dy * dy + pz * pz) - 1.0
+   519                                           
+   520        56       5766.0    103.0      0.0      if scale_min is None:
+   521                                                   scale_min = torch.min(scale_xyz)
+   522        56     388496.0   6937.4      2.5      return d_local * scale_min
+
+Total time: 0.134484 s
+File: /home/miyashita21/gitrepo/3dshapes_generator/profile_renderer_line.py
+Function: run_once at line 53
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    53                                               def run_once() -> torch.Tensor:
+    54         4  134481840.0 3.36e+07    100.0          return renderer.forward(
+    55         2        675.0    337.5      0.0              shape=inputs["shape"],
+    56         2        181.0     90.5      0.0              size=inputs["size"],
+    57         2        257.0    128.5      0.0              orientation=inputs["orientation"],
+    58         2        167.0     83.5      0.0              floor_hue=inputs["floor_hue"],
+    59         2        128.0     64.0      0.0              wall_hue=inputs["wall_hue"],
+    60         2        194.0     97.0      0.0              object_hue=inputs["object_hue"],
+    61         2        140.0     70.0      0.0              return_grad=False,
+    62                                                   )
+
