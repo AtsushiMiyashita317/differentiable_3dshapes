@@ -9,6 +9,7 @@ from typing import Sequence, Tuple
 import numpy as np
 from PIL import Image
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 # ------------------------------
@@ -99,6 +100,47 @@ DEFAULT_MESH_RESOLUTION_CONFIG = MeshResolutionConfig()
 # ------------------------------
 # Primitive meshes
 # ------------------------------
+
+
+def _device_cache_key(device: torch.device) -> tuple[str, int]:
+    return device.type, -1 if device.index is None else int(device.index)
+
+
+def _device_from_cache_key(device_type: str, device_index: int) -> torch.device:
+    return torch.device(device_type) if device_index < 0 else torch.device(device_type, device_index)
+
+
+@lru_cache(maxsize=128)
+def _cached_scalar_tensor(device_type: str, device_index: int, dtype: torch.dtype, value: float) -> torch.Tensor:
+    device = _device_from_cache_key(device_type, device_index)
+    return torch.tensor(float(value), device=device, dtype=dtype)
+
+
+@lru_cache(maxsize=128)
+def _cached_vec3_tensor(
+    device_type: str,
+    device_index: int,
+    dtype: torch.dtype,
+    x: float,
+    y: float,
+    z: float,
+) -> torch.Tensor:
+    device = _device_from_cache_key(device_type, device_index)
+    return torch.tensor([x, y, z], device=device, dtype=dtype)
+
+
+@lru_cache(maxsize=32)
+def _cached_image_plane(
+    h: int,
+    w: int,
+    device_type: str,
+    device_index: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = _device_from_cache_key(device_type, device_index)
+    xs = (torch.arange(w, device=device, dtype=dtype) + 0.5 - (w - 1) * 0.5) / (48.0 * (w / 64.0))
+    ys = -((torch.arange(h, device=device, dtype=dtype) + 0.5 - (h - 1) * 0.5) / (48.0 * (w / 64.0)))
+    return torch.meshgrid(xs, ys, indexing="xy")
 
 def _make_uv_sphere(lat_steps: int = 18, lon_steps: int = 36) -> Mesh:
     verts = []
@@ -341,12 +383,20 @@ def _get_meshes(
 def _downsample_mean(image_hwc: np.ndarray | torch.Tensor, factor: int) -> np.ndarray | torch.Tensor:
     if factor <= 1:
         return image_hwc
-    h, w, c = image_hwc.shape
     if torch.is_tensor(image_hwc):
-        # Use area interpolation for better antialiasing quality than block mean.
-        x = image_hwc.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
-        x = F.interpolate(x, size=(h // factor, w // factor), mode="area")
-        return x.squeeze(0).permute(1, 2, 0)
+        if image_hwc.ndim == 3:
+            h, w, _ = image_hwc.shape
+            # Use area interpolation for better antialiasing quality than block mean.
+            x = image_hwc.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+            x = F.interpolate(x, size=(h // factor, w // factor), mode="area")
+            return x.squeeze(0).permute(1, 2, 0)
+        if image_hwc.ndim == 4:
+            b, h, w, _ = image_hwc.shape
+            x = image_hwc.permute(0, 3, 1, 2)  # (B, C, H, W)
+            x = F.interpolate(x, size=(h // factor, w // factor), mode="area")
+            return x.permute(0, 2, 3, 1)
+        raise ValueError("torch image tensor must be HWC or BHWC")
+    h, w, c = image_hwc.shape
     image_hwc = image_hwc.reshape(h // factor, factor, w // factor, factor, c)
     return image_hwc.mean(axis=(1, 3))
 
@@ -420,14 +470,15 @@ def _hue_to_rgb_constrained(h: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     v = torch.clamp(v, 0.0, 1.0)
     c0 = torch.stack([v, (1.5 - v) * 0.5, (1.5 - v) * 0.5], dim=-1)
 
-    m = torch.tensor([0.5, 0.5, 0.5], device=h.device, dtype=h.dtype)
+    dkey = _device_cache_key(h.device)
+    m = _cached_vec3_tensor(dkey[0], dkey[1], h.dtype, 0.5, 0.5, 0.5)
     p0 = c0 - m
     rho2 = torch.sum(p0 * p0, dim=-1, keepdim=True)
-    eps = torch.tensor(1e-12, device=h.device, dtype=h.dtype)
+    eps = _cached_scalar_tensor(dkey[0], dkey[1], h.dtype, 1e-12)
     rho = torch.sqrt(torch.clamp(rho2, min=eps))
     u = p0 / rho
 
-    n = torch.tensor([1.0, 1.0, 1.0], device=h.device, dtype=h.dtype) / math.sqrt(3.0)
+    n = _cached_vec3_tensor(dkey[0], dkey[1], h.dtype, 1.0, 1.0, 1.0) / math.sqrt(3.0)
     w = torch.cross(n, u, dim=-1)
     w_norm = torch.sqrt(torch.clamp(torch.sum(w * w, dim=-1, keepdim=True), min=eps))
     w = w / w_norm
@@ -442,6 +493,7 @@ def _sdf_object_world(
     shape_id: int,
     center_world: torch.Tensor,
     scale_xyz: torch.Tensor,
+    scale_min: torch.Tensor | None = None,
 ) -> torch.Tensor:
     p_local = (p_world - center_world) / scale_xyz
     px, py, pz = p_local[..., 0], p_local[..., 1], p_local[..., 2]
@@ -461,10 +513,13 @@ def _sdf_object_world(
     else:
         # Capsule: segment from y=-1 to y=+1 with radius 1.
         cy = torch.clamp(py, -1.0, 1.0)
-        closest = torch.stack([torch.zeros_like(px), cy, torch.zeros_like(pz)], dim=-1)
-        d_local = torch.linalg.norm(p_local - closest, dim=-1) - 1.0
+        # Equivalent to norm(p_local - [0, cy, 0]) but avoids allocating a stacked tensor.
+        dy = py - cy
+        d_local = torch.sqrt(px * px + dy * dy + pz * pz) - 1.0
 
-    return d_local * torch.min(scale_xyz)
+    if scale_min is None:
+        scale_min = torch.min(scale_xyz)
+    return d_local * scale_min
 
 
 def _ray_march_object(
@@ -477,14 +532,23 @@ def _ray_march_object(
     eps: float = 1e-3,
     t_far: float = 100.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    h, w, _ = ray_dir.shape
-    t = torch.full((h, w), 1e-3, device=ray_dir.device, dtype=ray_dir.dtype)
-    hit = torch.zeros((h, w), device=ray_dir.device, dtype=torch.bool)
+    b, h, w, _ = ray_dir.shape
+    t = torch.full((b, h, w), 1e-3, device=ray_dir.device, dtype=ray_dir.dtype)
+    hit = torch.zeros((b, h, w), device=ray_dir.device, dtype=torch.bool)
+    center_world_b = center_world[:, None, None, :]
+    scale_xyz_b = scale_xyz[:, None, None, :]
+    scale_min = torch.min(scale_xyz_b)
 
     for _ in range(max_steps):
-        p = cam_pos[None, None, :] + ray_dir * t[..., None]
-        d = _sdf_object_world(p, shape_id, center_world, scale_xyz)
         active = (~hit) & (t < t_far)
+        p = cam_pos[:, None, None, :] + ray_dir * t[..., None]
+        d = _sdf_object_world(
+            p,
+            shape_id,
+            center_world_b,
+            scale_xyz_b,
+            scale_min=scale_min,
+        )
         new_hit = active & (torch.abs(d) < eps)
         hit = hit | new_hit
         step = torch.clamp(d, min=5e-4, max=0.5)
@@ -500,17 +564,21 @@ def _normal_from_sdf(
     scale_xyz: torch.Tensor,
     eps: float = 1e-3,
 ) -> torch.Tensor:
-    ex = torch.tensor([eps, 0.0, 0.0], device=p_world.device, dtype=p_world.dtype)
-    ey = torch.tensor([0.0, eps, 0.0], device=p_world.device, dtype=p_world.dtype)
-    ez = torch.tensor([0.0, 0.0, eps], device=p_world.device, dtype=p_world.dtype)
-    nx = _sdf_object_world(p_world + ex, shape_id, center_world, scale_xyz) - _sdf_object_world(
-        p_world - ex, shape_id, center_world, scale_xyz
+    ex = torch.zeros((1,) * (p_world.ndim - 1) + (3,), device=p_world.device, dtype=p_world.dtype)
+    ey = torch.zeros_like(ex)
+    ez = torch.zeros_like(ex)
+    ex[..., 0] = eps
+    ey[..., 1] = eps
+    ez[..., 2] = eps
+    scale_min = torch.min(scale_xyz)
+    nx = _sdf_object_world(p_world + ex, shape_id, center_world, scale_xyz, scale_min=scale_min) - _sdf_object_world(
+        p_world - ex, shape_id, center_world, scale_xyz, scale_min=scale_min
     )
-    ny = _sdf_object_world(p_world + ey, shape_id, center_world, scale_xyz) - _sdf_object_world(
-        p_world - ey, shape_id, center_world, scale_xyz
+    ny = _sdf_object_world(p_world + ey, shape_id, center_world, scale_xyz, scale_min=scale_min) - _sdf_object_world(
+        p_world - ey, shape_id, center_world, scale_xyz, scale_min=scale_min
     )
-    nz = _sdf_object_world(p_world + ez, shape_id, center_world, scale_xyz) - _sdf_object_world(
-        p_world - ez, shape_id, center_world, scale_xyz
+    nz = _sdf_object_world(p_world + ez, shape_id, center_world, scale_xyz, scale_min=scale_min) - _sdf_object_world(
+        p_world - ez, shape_id, center_world, scale_xyz, scale_min=scale_min
     )
     n = torch.stack([nx, ny, nz], dim=-1)
     return n / torch.clamp(torch.linalg.norm(n, dim=-1, keepdim=True), min=1e-8)
@@ -525,31 +593,50 @@ def _render_room(
     light_pos_world: torch.Tensor,
     ambient: torch.Tensor,
     diffuse: torch.Tensor,
+    room_bounds: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    plane_normals: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    eps: torch.Tensor | None = None,
+    sky: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    h, w, _ = ray_dir.shape
+    b, h, w, _ = ray_dir.shape
     dtype = ray_dir.dtype
     device = ray_dir.device
 
-    y0 = _as_torch_scalar(room_config.floor_y, device, dtype)
-    y1 = _as_torch_scalar(room_config.wall_top_y, device, dtype)
-    half_w = _as_torch_scalar(room_config.half_width, device, dtype)
-    half_d = _as_torch_scalar(room_config.half_depth, device, dtype)
-    x0, x1 = -half_w, half_w
-    z0, z1 = -half_d, half_d
+    if room_bounds is None:
+        y0 = _as_torch_scalar(room_config.floor_y, device, dtype)
+        y1 = _as_torch_scalar(room_config.wall_top_y, device, dtype)
+        half_w = _as_torch_scalar(room_config.half_width, device, dtype)
+        half_d = _as_torch_scalar(room_config.half_depth, device, dtype)
+        x0, x1 = -half_w, half_w
+        z0, z1 = -half_d, half_d
+    else:
+        y0, y1, x0, x1, z0, z1 = room_bounds
 
-    sky = torch.tensor([0.72, 0.88, 1.0], device=device, dtype=dtype)
-    color = sky[None, None, :].expand(h, w, 3).clone()
-    depth = torch.full((h, w), float("inf"), device=device, dtype=dtype)
-    surface_id = torch.full((h, w), -1, device=device, dtype=torch.int64)
-    hit_points = torch.zeros((h, w, 3), device=device, dtype=dtype)
+    if sky is None:
+        dkey = _device_cache_key(device)
+        sky = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.72, 0.88, 1.0)
+    color = sky[None, None, None, :].expand(b, h, w, 3).clone()
+    depth = torch.full((b, h, w), float("inf"), device=device, dtype=dtype)
+    surface_id = torch.full((b, h, w), -1, device=device, dtype=torch.int64)
+    hit_points = torch.zeros((b, h, w, 3), device=device, dtype=dtype)
+    if eps is None:
+        dkey = _device_cache_key(device)
+        eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1e-8)
+    if plane_normals is None:
+        dkey = _device_cache_key(device)
+        n_floor = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 1.0, 0.0)
+        n_back = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 0.0, 1.0)
+        n_front = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 0.0, -1.0)
+        n_left = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 1.0, 0.0, 0.0)
+        n_right = _cached_vec3_tensor(dkey[0], dkey[1], dtype, -1.0, 0.0, 0.0)
+    else:
+        n_floor, n_back, n_front, n_left, n_right = plane_normals
 
     def safe_div(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
-        eps = torch.tensor(1e-8, device=device, dtype=dtype)
         den_safe = torch.where(torch.abs(den) > eps, den, torch.where(den >= 0.0, eps, -eps))
         return num / den_safe
 
     def plane_update(
-        den: torch.Tensor,
         t: torch.Tensor,
         p: torch.Tensor,
         valid: torch.Tensor,
@@ -558,56 +645,56 @@ def _render_room(
         surf_id: int,
     ) -> None:
         nonlocal color, depth, surface_id, hit_points
-        z_cam = torch.sum((p - cam_pos[None, None, :]) * ray_dir, dim=-1)
-        l = light_pos_world[None, None, :] - p
+        l = light_pos_world[:, None, None, :] - p
         l = l / torch.clamp(torch.linalg.norm(l, dim=-1, keepdim=True), min=1e-8)
-        ndotl = torch.clamp(torch.sum(l * normal[None, None, :], dim=-1), min=0.0)
+        ndotl = torch.clamp(torch.sum(l * normal[None, None, None, :], dim=-1), min=0.0)
         lit = ambient + diffuse * ndotl
-        c = torch.clamp(base_rgb[None, None, :] * lit[..., None], 0.0, 1.0)
-        closer = valid & (t > 1e-6) & (z_cam > 1e-6) & (z_cam < depth)
-        depth = torch.where(closer, z_cam, depth)
+        c = torch.clamp(base_rgb[:, None, None, :] * lit[..., None], 0.0, 1.0)
+        closer = valid & (t > 1e-6) & (t < depth)
+        depth = torch.where(closer, t, depth)
         color = torch.where(closer[..., None], c, color)
         surface_id = torch.where(closer, torch.full_like(surface_id, surf_id), surface_id)
         hit_points = torch.where(closer[..., None], p, hit_points)
 
     # floor
     den = ray_dir[..., 1]
-    t = safe_div(y0 - cam_pos[1], den)
-    p = cam_pos[None, None, :] + t[..., None] * ray_dir
+    t = safe_div(y0 - cam_pos[:, None, None, 1], den)
+    p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
     valid = (torch.abs(den) > 1e-8) & (p[..., 0] >= x0) & (p[..., 0] <= x1) & (p[..., 2] >= z0) & (p[..., 2] <= z1)
-    plane_update(den, t, p, valid, torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype), floor_rgb, surf_id=0)
+    plane_update(t, p, valid, n_floor, floor_rgb, surf_id=0)
 
     if room_config.draw_back_wall:
         den = ray_dir[..., 2]
-        t = safe_div(z0 - cam_pos[2], den)
-        p = cam_pos[None, None, :] + t[..., None] * ray_dir
+        t = safe_div(z0 - cam_pos[:, None, None, 2], den)
+        p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
         valid = (torch.abs(den) > 1e-8) & (p[..., 0] >= x0) & (p[..., 0] <= x1) & (p[..., 1] >= y0) & (p[..., 1] <= y1)
-        plane_update(den, t, p, valid, torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype), wall_rgb, surf_id=1)
+        plane_update(t, p, valid, n_back, wall_rgb, surf_id=1)
     if room_config.draw_front_wall:
         den = ray_dir[..., 2]
-        t = safe_div(z1 - cam_pos[2], den)
-        p = cam_pos[None, None, :] + t[..., None] * ray_dir
+        t = safe_div(z1 - cam_pos[:, None, None, 2], den)
+        p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
         valid = (torch.abs(den) > 1e-8) & (p[..., 0] >= x0) & (p[..., 0] <= x1) & (p[..., 1] >= y0) & (p[..., 1] <= y1)
-        plane_update(den, t, p, valid, torch.tensor([0.0, 0.0, -1.0], device=device, dtype=dtype), wall_rgb, surf_id=2)
+        plane_update(t, p, valid, n_front, wall_rgb, surf_id=2)
     if room_config.draw_left_wall:
         den = ray_dir[..., 0]
-        t = safe_div(x0 - cam_pos[0], den)
-        p = cam_pos[None, None, :] + t[..., None] * ray_dir
+        t = safe_div(x0 - cam_pos[:, None, None, 0], den)
+        p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
         valid = (torch.abs(den) > 1e-8) & (p[..., 2] >= z0) & (p[..., 2] <= z1) & (p[..., 1] >= y0) & (p[..., 1] <= y1)
-        plane_update(den, t, p, valid, torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype), wall_rgb, surf_id=3)
+        plane_update(t, p, valid, n_left, wall_rgb, surf_id=3)
     if room_config.draw_right_wall:
         den = ray_dir[..., 0]
-        t = safe_div(x1 - cam_pos[0], den)
-        p = cam_pos[None, None, :] + t[..., None] * ray_dir
+        t = safe_div(x1 - cam_pos[:, None, None, 0], den)
+        p = cam_pos[:, None, None, :] + t[..., None] * ray_dir
         valid = (torch.abs(den) > 1e-8) & (p[..., 2] >= z0) & (p[..., 2] <= z1) & (p[..., 1] >= y0) & (p[..., 1] <= y1)
-        plane_update(den, t, p, valid, torch.tensor([-1.0, 0.0, 0.0], device=device, dtype=dtype), wall_rgb, surf_id=4)
+        plane_update(t, p, valid, n_right, wall_rgb, surf_id=4)
 
     floor_mask = surface_id == 0
     return color, depth, floor_mask, hit_points
 
 
 def _soft_shadow_floor(
-    floor_points: torch.Tensor,  # (N,3)
+    floor_points: torch.Tensor,  # (B,H,W,3)
+    floor_mask: torch.Tensor,    # (B,H,W)
     light_pos_world: torch.Tensor,
     shape_id: int,
     center_world: torch.Tensor,
@@ -616,17 +703,44 @@ def _soft_shadow_floor(
     sigma: float = 0.02,
 ) -> torch.Tensor:
     if floor_points.numel() == 0:
-        return torch.empty((0,), device=floor_points.device, dtype=floor_points.dtype)
+        return torch.empty(floor_mask.shape, device=floor_points.device, dtype=floor_points.dtype)
+    b, h, w, _ = floor_points.shape
     s = torch.linspace(0.02, 0.98, n_samples, device=floor_points.device, dtype=floor_points.dtype)
-    ray = light_pos_world[None, :] - floor_points
+    s = s[None, None, None, :, None]
+    ray = light_pos_world[:, None, None, :] - floor_points
     dist = torch.linalg.norm(ray, dim=-1, keepdim=True)
     ray_dir = ray / torch.clamp(dist, min=1e-8)
-    samples = floor_points[:, None, :] + ray_dir[:, None, :] * (dist[:, None, :] * s[None, :, None])
-    d = _sdf_object_world(samples.reshape(-1, 3), shape_id, center_world, scale_xyz).reshape(floor_points.shape[0], n_samples)
+    samples = floor_points[:, :, :, None, :] + ray_dir[:, :, :, None, :] * (dist[:, :, :, None, :] * s)
+    scale_min = torch.min(scale_xyz[:, None, :])
+    d = _sdf_object_world(
+        samples.reshape(b, -1, 3),
+        shape_id,
+        center_world[:, None, :],
+        scale_xyz[:, None, :],
+        scale_min=scale_min,
+    ).reshape(b, h, w, n_samples)
     occ = torch.sigmoid((-d) / sigma)
     # Visibility in [0,1], stronger than mean-transmittance and closer to hard-shadow behavior.
     vis = 1.0 - occ.max(dim=-1).values
-    return torch.clamp(vis, 0.0, 1.0)
+    vis = torch.clamp(vis, 0.0, 1.0)
+    return torch.where(floor_mask, vis, torch.ones_like(vis))
+
+
+def _factor_to_1d(
+    x: int | float | torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str,
+) -> torch.Tensor:
+    if torch.is_tensor(x):
+        t = x.to(device=device, dtype=dtype)
+        if t.ndim == 0:
+            return t.reshape(1)
+        if t.ndim == 1:
+            return t
+        raise ValueError(f"{name} must be scalar or 1D tensor")
+    return torch.tensor([float(x)], device=device, dtype=dtype)
 
 
 def render_3dshapes_image(
@@ -649,15 +763,41 @@ def render_3dshapes_image(
     object_config: ObjectConfig | None = None,
     output_chw: bool = True,
 ) -> torch.Tensor:
-    """Differentiable torch renderer.
+    """Differentiable renderer for a fixed shape id.
 
-    Gradients are available for tensor inputs in main factors and also scalar/vector
-    fields inside camera/lighting/room/object configs when passed as torch tensors.
+    `shape` is treated as an integer (0..3). For mixed-shape batches, use
+    `render_3dshapes_image_grouped`.
     """
     refs = [size, orientation, floor_hue, wall_hue, object_hue, hue_v]
-    t_ref = next((x for x in refs if torch.is_tensor(x)), None)
+    float_ref = next((x for x in refs if torch.is_tensor(x) and torch.is_floating_point(x)), None)
+    any_ref = next((x for x in refs if torch.is_tensor(x)), None)
+    t_ref = float_ref if float_ref is not None else any_ref
     device = t_ref.device if t_ref is not None else torch.device("cpu")
-    dtype = t_ref.dtype if t_ref is not None else torch.float32
+    dtype = t_ref.dtype if t_ref is not None and torch.is_floating_point(t_ref) else torch.float32
+    dkey = _device_cache_key(device)
+
+    size_b = _factor_to_1d(size, device=device, dtype=dtype, name="size")
+    ori_b = _factor_to_1d(orientation, device=device, dtype=dtype, name="orientation")
+    floor_b = _factor_to_1d(floor_hue, device=device, dtype=dtype, name="floor_hue")
+    wall_b = _factor_to_1d(wall_hue, device=device, dtype=dtype, name="wall_hue")
+    obj_b = _factor_to_1d(object_hue, device=device, dtype=dtype, name="object_hue")
+
+    lengths = [size_b.shape[0], ori_b.shape[0], floor_b.shape[0], wall_b.shape[0], obj_b.shape[0]]
+    bsz = max(lengths)
+    names = ["size", "orientation", "floor_hue", "wall_hue", "object_hue"]
+    for n, ln in zip(names, lengths):
+        if ln not in (1, bsz):
+            raise ValueError(f"{n} batch size must be 1 or {bsz}, got {ln}")
+
+    def expand1(x: torch.Tensor) -> torch.Tensor:
+        return x if x.shape[0] == bsz else x.expand(bsz)
+
+    size_b = expand1(size_b).clamp(0.4, 1.8)
+    ori_b = expand1(ori_b)
+    floor_b = expand1(floor_b)
+    wall_b = expand1(wall_b)
+    obj_b = expand1(obj_b)
+    sid = max(0, min(3, int(shape)))
 
     lighting_config = lighting_config or DEFAULT_LIGHTING_CONFIG
     mesh_resolution_config = mesh_resolution_config or DEFAULT_MESH_RESOLUTION_CONFIG
@@ -665,22 +805,15 @@ def render_3dshapes_image(
     room_config = room_config or DEFAULT_ROOM_CONFIG
     object_config = object_config or DEFAULT_OBJECT_CONFIG
 
-    size_t = _as_torch_scalar(size, device, dtype).clamp(0.4, 1.8)
-    ori_t = _as_torch_scalar(orientation, device, dtype)
-    floor_h = _as_torch_scalar(floor_hue, device, dtype)
-    wall_h = _as_torch_scalar(wall_hue, device, dtype)
-    obj_h = _as_torch_scalar(object_hue, device, dtype)
-    hue_v_t = _as_torch_scalar(hue_v, device, dtype).clamp(0.0, 1.0)
-
     orientation_period_t = _as_torch_scalar(orientation_period, device, dtype)
-    period_eps = torch.tensor(1e-8, device=device, dtype=dtype)
+    period_eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1e-8)
     orientation_period_safe = torch.where(
         torch.abs(orientation_period_t) > period_eps,
         orientation_period_t,
         torch.where(orientation_period_t >= 0.0, period_eps, -period_eps),
     )
     yaw_offset_deg_t = _as_torch_scalar(camera_config.yaw_offset_deg, device, dtype)
-    theta = 2.0 * torch.pi * torch.remainder(ori_t / orientation_period_safe, 1.0) + (
+    theta = 2.0 * torch.pi * torch.remainder(ori_b / orientation_period_safe, 1.0) + (
         yaw_offset_deg_t * (torch.pi / 180.0)
     )
 
@@ -688,47 +821,74 @@ def render_3dshapes_image(
     h0, w0 = _parse_image_size(image_size)
     h = h0 * ssaa_scale
     w = w0 * ssaa_scale
-    xs = (torch.arange(w, device=device, dtype=dtype) + 0.5 - (w - 1) * 0.5) / (48.0 * (w / 64.0))
-    ys = -((torch.arange(h, device=device, dtype=dtype) + 0.5 - (h - 1) * 0.5) / (48.0 * (w / 64.0)))
-    dx, dy = torch.meshgrid(xs, ys, indexing="xy")
+    dx, dy = _cached_image_plane(h, w, dkey[0], dkey[1], dtype)
 
     cam_radius = _as_torch_scalar(camera_config.radius, device, dtype)
     cam_height = _as_torch_scalar(camera_config.height, device, dtype)
     target = _as_torch_vec3(camera_config.target, device, dtype)
-    cam_pos = torch.stack([cam_radius * torch.sin(theta), cam_height, cam_radius * torch.cos(theta)])
+    cam_pos = torch.stack(
+        [
+            cam_radius * torch.sin(theta),
+            torch.full_like(theta, cam_height),
+            cam_radius * torch.cos(theta),
+        ],
+        dim=-1,
+    )
 
-    forward = (target - cam_pos)
-    forward = forward / torch.clamp(torch.linalg.norm(forward), min=1e-8)
-    up_hint = torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype)
-    right = torch.cross(forward, up_hint, dim=0)
-    right = right / torch.clamp(torch.linalg.norm(right), min=1e-8)
-    up = torch.cross(right, forward, dim=0)
-    up = up / torch.clamp(torch.linalg.norm(up), min=1e-8)
+    forward = target[None, :] - cam_pos
+    forward = forward / torch.clamp(torch.linalg.norm(forward, dim=-1, keepdim=True), min=1e-8)
+    up_hint = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 1.0, 0.0).expand(bsz, 3)
+    right = torch.cross(forward, up_hint, dim=-1)
+    right = right / torch.clamp(torch.linalg.norm(right, dim=-1, keepdim=True), min=1e-8)
+    up = torch.cross(right, forward, dim=-1)
+    up = up / torch.clamp(torch.linalg.norm(up, dim=-1, keepdim=True), min=1e-8)
 
-    ray_dir = right[None, None, :] * dx[..., None] + up[None, None, :] * dy[..., None] + forward[None, None, :]
+    ray_dir = (
+        right[:, None, None, :] * dx[None, :, :, None]
+        + up[:, None, None, :] * dy[None, :, :, None]
+        + forward[:, None, None, :]
+    )
     ray_dir = ray_dir / torch.clamp(torch.linalg.norm(ray_dir, dim=-1, keepdim=True), min=1e-8)
 
-    floor_rgb = _hue_to_rgb_constrained(floor_h, hue_v_t)
-    wall_rgb = _hue_to_rgb_constrained(wall_h, hue_v_t)
-    obj_rgb = _hue_to_rgb_constrained(obj_h, hue_v_t)
+    hue_v_t = _as_torch_scalar(hue_v, device, dtype).clamp(0.0, 1.0)
+    floor_rgb = _hue_to_rgb_constrained(floor_b, hue_v_t)
+    wall_rgb = _hue_to_rgb_constrained(wall_b, hue_v_t)
+    obj_rgb = _hue_to_rgb_constrained(obj_b, hue_v_t)
 
     light_base = _as_torch_vec3(lighting_config.light_position_world, device, dtype)
     c = torch.cos(theta)
     s = torch.sin(theta)
-    z = torch.tensor(0.0, device=device, dtype=dtype)
-    o = torch.tensor(1.0, device=device, dtype=dtype)
+    z = torch.zeros_like(c)
+    o = torch.ones_like(c)
     rot = torch.stack(
         [
-            torch.stack([c, z, s]),
-            torch.stack([z, o, z]),
-            torch.stack([-s, z, c]),
-        ]
+            torch.stack([c, z, s], dim=-1),
+            torch.stack([z, o, z], dim=-1),
+            torch.stack([-s, z, c], dim=-1),
+        ],
+        dim=1,
     )
     light_pos_world = rot @ light_base
     ambient = _as_torch_scalar(lighting_config.ambient, device, dtype).clamp(0.0, 1.0)
     diffuse = _as_torch_scalar(lighting_config.diffuse, device, dtype).clamp(0.0, 2.0)
+    shadow_s = _as_torch_scalar(shadow_strength, device, dtype).clamp(0.0, 1.0)
+    room_y0 = _as_torch_scalar(room_config.floor_y, device, dtype)
+    room_y1 = _as_torch_scalar(room_config.wall_top_y, device, dtype)
+    half_w = _as_torch_scalar(room_config.half_width, device, dtype)
+    half_d = _as_torch_scalar(room_config.half_depth, device, dtype)
+    room_x0, room_x1 = -half_w, half_w
+    room_z0, room_z1 = -half_d, half_d
+    room_bounds = (room_y0, room_y1, room_x0, room_x1, room_z0, room_z1)
+    room_eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1e-8)
+    room_sky = _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.72, 0.88, 1.0)
+    room_normals = (
+        _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 1.0, 0.0),
+        _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 0.0, 1.0),
+        _cached_vec3_tensor(dkey[0], dkey[1], dtype, 0.0, 0.0, -1.0),
+        _cached_vec3_tensor(dkey[0], dkey[1], dtype, 1.0, 0.0, 0.0),
+        _cached_vec3_tensor(dkey[0], dkey[1], dtype, -1.0, 0.0, 0.0),
+    )
 
-    shape_id = int(max(0, min(3, int(shape))))
     meshes = _get_meshes(
         cylinder_radial_steps=mesh_resolution_config.cylinder_radial_steps,
         sphere_lat_steps=mesh_resolution_config.sphere_lat_steps,
@@ -736,23 +896,25 @@ def render_3dshapes_image(
         capsule_radial_steps=mesh_resolution_config.capsule_radial_steps,
         capsule_hemi_steps=mesh_resolution_config.capsule_hemi_steps,
     )
-    mesh = meshes[shape_id]
-    base_scale = _as_torch_shape_vec3(object_config.base_scales, shape_id, device, dtype)
-    base_scale = base_scale * _as_torch_scalar(object_config.global_scale_multiplier, device, dtype)
-    scale = base_scale * size_t
 
-    extent_y = torch.max(torch.abs(torch.tensor(mesh.verts[:, 1], device=device, dtype=dtype)))
+    mesh = meshes[sid]
+    base_scale = _as_torch_shape_vec3(object_config.base_scales, sid, device, dtype)
+    base_scale = base_scale * _as_torch_scalar(object_config.global_scale_multiplier, device, dtype)
+    scale_g = base_scale[None, :] * size_b[:, None]
+
+    extent_y = _cached_scalar_tensor(dkey[0], dkey[1], dtype, float(np.max(np.abs(mesh.verts[:, 1]))))
     if object_config.use_auto_grounding:
-        clearance = _as_torch_shape_scalar(object_config.ground_clearance_by_shape, shape_id, device, dtype)
-        center_y = _as_torch_scalar(room_config.floor_y, device, dtype) + clearance + extent_y * scale[1]
+        clearance = _as_torch_shape_scalar(object_config.ground_clearance_by_shape, sid, device, dtype)
+        center_y = room_y0 + clearance + extent_y * scale_g[:, 1]
     else:
-        center_y = _as_torch_shape_scalar(object_config.center_y_by_shape, shape_id, device, dtype)
-    center_world = torch.stack(
+        center_y = _as_torch_shape_scalar(object_config.center_y_by_shape, sid, device, dtype).expand(bsz)
+    center_world_g = torch.stack(
         [
-            _as_torch_scalar(object_config.center_x, device, dtype),
+            _as_torch_scalar(object_config.center_x, device, dtype).expand(bsz),
             center_y,
-            _as_torch_scalar(object_config.center_z, device, dtype),
-        ]
+            _as_torch_scalar(object_config.center_z, device, dtype).expand(bsz),
+        ],
+        dim=-1,
     )
 
     room_color, room_depth, floor_mask, floor_pts = _render_room(
@@ -764,58 +926,238 @@ def render_3dshapes_image(
         light_pos_world=light_pos_world,
         ambient=ambient,
         diffuse=diffuse,
+        room_bounds=room_bounds,
+        plane_normals=room_normals,
+        eps=room_eps,
+        sky=room_sky,
     )
 
-    if floor_mask.any():
-        flat_idx = floor_mask.reshape(-1)
-        pts = floor_pts.reshape(-1, 3)[flat_idx]
-        vis = _soft_shadow_floor(
-        floor_points=pts,
+    vis = _soft_shadow_floor(
+        floor_points=floor_pts,
+        floor_mask=floor_mask,
         light_pos_world=light_pos_world,
-        shape_id=shape_id,
-        center_world=center_world,
-        scale_xyz=scale,
-            n_samples=24,
-            sigma=0.03,
-        )
-        l = light_pos_world[None, :] - pts
-        l = l / torch.clamp(torch.linalg.norm(l, dim=-1, keepdim=True), min=1e-8)
-        ndotl = torch.clamp(l[:, 1], min=0.0)
-        s = _as_torch_scalar(shadow_strength, device, dtype).clamp(0.0, 1.0)
-        # Match numpy semantics: ambient is preserved, direct term is reduced by shadow.
-        lit = ambient + diffuse * ndotl * (1.0 - s * (1.0 - vis))
-        floor_shaded = torch.clamp(floor_rgb[None, :] * lit[:, None], 0.0, 1.0)
-
-        flat_color = room_color.reshape(-1, 3)
-        flat_color[flat_idx] = floor_shaded
-        room_color = flat_color.reshape(h, w, 3)
+        shape_id=sid,
+        center_world=center_world_g,
+        scale_xyz=scale_g,
+        n_samples=24,
+        sigma=0.03,
+    )
+    l = light_pos_world[:, None, None, :] - floor_pts
+    l = l / torch.clamp(torch.linalg.norm(l, dim=-1, keepdim=True), min=1e-8)
+    ndotl = torch.clamp(l[..., 1], min=0.0)
+    lit = ambient + diffuse * ndotl * (1.0 - shadow_s * (1.0 - vis))
+    floor_shaded = torch.clamp(floor_rgb[:, None, None, :] * lit[..., None], 0.0, 1.0)
+    room_color = torch.where(floor_mask[..., None], floor_shaded, room_color)
 
     hit_obj, t_obj = _ray_march_object(
         cam_pos=cam_pos,
         ray_dir=ray_dir,
-        shape_id=shape_id,
-        center_world=center_world,
-        scale_xyz=scale,
+        shape_id=sid,
+        center_world=center_world_g,
+        scale_xyz=scale_g,
     )
-    p_obj = cam_pos[None, None, :] + ray_dir * t_obj[..., None]
-    n_obj = _normal_from_sdf(p_obj.reshape(-1, 3), shape_id, center_world, scale).reshape(h, w, 3)
-    l_obj = light_pos_world[None, None, :] - p_obj
+    p_obj = cam_pos[:, None, None, :] + ray_dir * t_obj[..., None]
+    n_obj = _normal_from_sdf(
+        p_obj,
+        sid,
+        center_world_g[:, None, None, :],
+        scale_g[:, None, None, :],
+    )
+    l_obj = light_pos_world[:, None, None, :] - p_obj
     l_obj = l_obj / torch.clamp(torch.linalg.norm(l_obj, dim=-1, keepdim=True), min=1e-8)
     ndotl_obj = torch.clamp(torch.sum(n_obj * l_obj, dim=-1), min=0.0)
     obj_lit = ambient + diffuse * ndotl_obj
-    obj_color = torch.clamp(obj_rgb[None, None, :] * obj_lit[..., None], 0.0, 1.0)
-
+    obj_color = torch.clamp(obj_rgb[:, None, None, :] * obj_lit[..., None], 0.0, 1.0)
     obj_front = hit_obj & (t_obj < room_depth)
     out = torch.where(obj_front[..., None], obj_color, room_color)
 
     if ssaa_scale > 1:
         out = _downsample_mean(out, ssaa_scale)
     if output_chw:
-        out = out.permute(2, 0, 1)
+        out = out.permute(0, 3, 1, 2)
+    if bsz == 1:
+        return out[0]
     return out
+
+class Render3DShapesModule(nn.Module):
+    """nn.Module wrapper around `render_3dshapes_image`.
+
+    Main factors are provided to `forward`; all other renderer settings are fixed at init.
+    """
+
+    def __init__(
+        self,
+        *,
+        hue_v: float | torch.Tensor = 0.9,
+        orientation_period: float | torch.Tensor = 1.0,
+        shadow_strength: float | torch.Tensor = 10.0,
+        ssaa_scale: int = 4,
+        image_size: int | Tuple[int, int] = 64,
+        lighting_config: LightingConfig | None = None,
+        mesh_resolution_config: MeshResolutionConfig | None = None,
+        camera_config: CameraConfig | None = None,
+        room_config: RoomConfig | None = None,
+        object_config: ObjectConfig | None = None,
+        output_chw: bool = True,
+    ) -> None:
+        super().__init__()
+        self.hue_v = hue_v
+        self.orientation_period = orientation_period
+        self.shadow_strength = shadow_strength
+        self.ssaa_scale = ssaa_scale
+        self.image_size = image_size
+        self.lighting_config = lighting_config
+        self.mesh_resolution_config = mesh_resolution_config
+        self.camera_config = camera_config
+        self.room_config = room_config
+        self.object_config = object_config
+        self.output_chw = output_chw
+
+    def forward(
+        self,
+        shape: int | torch.Tensor,
+        size: float | torch.Tensor,
+        orientation: float | torch.Tensor,
+        floor_hue: float | torch.Tensor,
+        wall_hue: float | torch.Tensor,
+        object_hue: float | torch.Tensor,
+        return_grad: bool = False,
+    ) -> torch.Tensor | tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        kwargs = dict(
+            hue_v=self.hue_v,
+            orientation_period=self.orientation_period,
+            shadow_strength=self.shadow_strength,
+            ssaa_scale=self.ssaa_scale,
+            image_size=self.image_size,
+            lighting_config=self.lighting_config,
+            mesh_resolution_config=self.mesh_resolution_config,
+            camera_config=self.camera_config,
+            room_config=self.room_config,
+            object_config=self.object_config,
+            output_chw=self.output_chw,
+        )
+
+        refs = [shape, size, orientation, floor_hue, wall_hue, object_hue, self.hue_v]
+        float_ref = next((x for x in refs if torch.is_tensor(x) and torch.is_floating_point(x)), None)
+        any_ref = next((x for x in refs if torch.is_tensor(x)), None)
+        t_ref = float_ref if float_ref is not None else any_ref
+        device = t_ref.device if t_ref is not None else torch.device("cpu")
+        dtype = t_ref.dtype if t_ref is not None and torch.is_floating_point(t_ref) else torch.float32
+
+        shape_b = _factor_to_1d(shape, device=device, dtype=dtype, name="shape")
+        size_b = _factor_to_1d(size, device=device, dtype=dtype, name="size")
+        ori_b = _factor_to_1d(orientation, device=device, dtype=dtype, name="orientation")
+        floor_b = _factor_to_1d(floor_hue, device=device, dtype=dtype, name="floor_hue")
+        wall_b = _factor_to_1d(wall_hue, device=device, dtype=dtype, name="wall_hue")
+        obj_b = _factor_to_1d(object_hue, device=device, dtype=dtype, name="object_hue")
+
+        lengths = [shape_b.shape[0], size_b.shape[0], ori_b.shape[0], floor_b.shape[0], wall_b.shape[0], obj_b.shape[0]]
+        bsz = max(lengths)
+        names = ["shape", "size", "orientation", "floor_hue", "wall_hue", "object_hue"]
+        for n, ln in zip(names, lengths):
+            if ln not in (1, bsz):
+                raise ValueError(f"{n} batch size must be 1 or {bsz}, got {ln}")
+
+        def expand1(x: torch.Tensor) -> torch.Tensor:
+            return x if x.shape[0] == bsz else x.expand(bsz)
+
+        shape_ids = torch.clamp(expand1(shape_b).to(torch.int64), 0, 3)
+        size_b = expand1(size_b)
+        ori_b = expand1(ori_b)
+        floor_b = expand1(floor_b)
+        wall_b = expand1(wall_b)
+        obj_b = expand1(obj_b)
+
+        if return_grad:
+            jac_out: list[torch.Tensor] | None = None
+            img_out: torch.Tensor | None = None
+            for sid in range(4):
+                idx = torch.nonzero(shape_ids == sid, as_tuple=False).reshape(-1)
+                if idx.numel() == 0:
+                    continue
+
+                def render_single_fixed_shape(
+                    size_i: torch.Tensor,
+                    orientation_i: torch.Tensor,
+                    floor_hue_i: torch.Tensor,
+                    wall_hue_i: torch.Tensor,
+                    object_hue_i: torch.Tensor,
+                ):
+                    image = render_3dshapes_image(
+                        shape=sid,
+                        size=size_i.unsqueeze(0),
+                        orientation=orientation_i.unsqueeze(0),
+                        floor_hue=floor_hue_i.unsqueeze(0),
+                        wall_hue=wall_hue_i.unsqueeze(0),
+                        object_hue=object_hue_i.unsqueeze(0),
+                        **kwargs,
+                    )
+                    return image.squeeze(0), image.squeeze(0)
+
+                renderer_with_grad = torch.func.vmap(
+                    torch.func.jacfwd(
+                        render_single_fixed_shape,
+                        argnums=(0, 1, 2, 3, 4),
+                        has_aux=True,
+                    )
+                )
+                jac_g, img_g = renderer_with_grad(size_b[idx], ori_b[idx], floor_b[idx], wall_b[idx], obj_b[idx])
+
+                if jac_out is None or img_out is None:
+                    img_out = torch.empty((bsz,) + tuple(img_g.shape[1:]), device=img_g.device, dtype=img_g.dtype)
+                    jac_out = [
+                        torch.empty((bsz,) + tuple(j.shape[1:]), device=j.device, dtype=j.dtype)
+                        for j in jac_g
+                    ]
+                img_out[idx] = img_g
+                for k in range(5):
+                    jac_out[k][idx] = jac_g[k]
+
+            if jac_out is None or img_out is None:
+                raise RuntimeError("No valid shape ids in input.")
+            return tuple(jac_out), img_out
+
+        if bsz == 1:
+            sid = int(shape_ids[0].item())
+            return render_3dshapes_image(
+                shape=sid,
+                size=size_b,
+                orientation=ori_b,
+                floor_hue=floor_b,
+                wall_hue=wall_b,
+                object_hue=obj_b,
+                **kwargs,
+            )
+
+        out: torch.Tensor | None = None
+        for sid in range(4):
+            idx = torch.nonzero(shape_ids == sid, as_tuple=False).reshape(-1)
+            if idx.numel() == 0:
+                continue
+            out_g = render_3dshapes_image(
+                shape=sid,
+                size=size_b[idx],
+                orientation=ori_b[idx],
+                floor_hue=floor_b[idx],
+                wall_hue=wall_b[idx],
+                object_hue=obj_b[idx],
+                **kwargs,
+            )
+            if out_g.ndim == 3:
+                out_g = out_g.unsqueeze(0)
+            if out is None:
+                out = torch.empty((bsz,) + tuple(out_g.shape[1:]), device=out_g.device, dtype=out_g.dtype)
+            out[idx] = out_g
+
+        if out is None:
+            raise RuntimeError("No valid shape ids in input.")
+        return out
 
 
 if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device:", device)
+
     # Main settings + visualization GIF (image | differential image).
     light_cfg = LightingConfig(
         light_position_world=(-7, 30, -2),  # 光源位置 (world座標)
@@ -856,6 +1198,21 @@ if __name__ == "__main__":
         use_auto_grounding=True,
     )
 
+    renderer = Render3DShapesModule(
+        hue_v=0.9,
+        orientation_period=1.0,
+        shadow_strength=0.8,
+        ssaa_scale=4,
+        image_size=64,
+        lighting_config=light_cfg,
+        mesh_resolution_config=mesh_res_cfg,
+        camera_config=cam_cfg,
+        room_config=room_cfg,
+        object_config=obj_cfg,
+        output_chw=True,
+    )
+    renderer = renderer.to(device)
+
     out_dir = Path("samples")
     out_dir.mkdir(exist_ok=True)
     main_params = dict(
@@ -876,72 +1233,84 @@ if __name__ == "__main__":
         # ssaa_scale=8,
         # image_size=64,
     )
-
-    def _render_np(local_params: dict) -> np.ndarray:
-        with torch.no_grad():
-            return render_3dshapes_image(**local_params).cpu().numpy()
-
-    def _autograd_diff_rgb(local_params: dict, key: str, val: float) -> np.ndarray:
-        x = torch.tensor(float(val), dtype=torch.float32)
-
-        def fn(xx: torch.Tensor) -> torch.Tensor:
-            p = dict(local_params)
-            p[key] = xx
-            return render_3dshapes_image(**p)
-
-        _, dimg = torch.autograd.functional.jvp(
-            fn,
-            (x,),
-            (torch.ones_like(x),),
-            create_graph=False,
-            strict=False,
-        )
-        diff = dimg.detach().cpu().numpy()
-        diff_hwc = np.transpose(diff, (1, 2, 0))  # (H, W, 3)
-        scale = float(np.percentile(np.abs(diff_hwc), 99.5))
-        if scale < 1e-8:
-            scale = 1.0
-        # Signed visualization: 0 -> gray(0.5), positive -> brighter, negative -> darker.
-        diff_vis = 0.5 + 0.5 * (diff_hwc / scale)
-        return np.clip(diff_vis, 0.0, 1.0).astype(np.float32)
-
-    # Save one still image with current main settings.
-    still = _render_np(main_params)
-    still_path = out_dir / "main_render.png"
-    still_hwc = np.transpose(still, (1, 2, 0))
-    Image.fromarray((np.clip(still_hwc, 0.0, 1.0) * 255).astype(np.uint8)).save(still_path)
-    print("saved:", still_path)
+    fixed_shape_id = int(main_params["shape"])
 
     # Build GIF frames:
     # rows = orientation / size / floor_hue / wall_hue / object_hue, cols = image | differential.
-    n_frames = 36
+    n_frames = 40
     orientation_vals = np.linspace(0.0, 1.0, n_frames, endpoint=False, dtype=np.float32)
     size_vals = np.linspace(0.7, 1.5, n_frames, endpoint=True, dtype=np.float32)
     color_vals = np.linspace(0.0, 1.0, n_frames, endpoint=False, dtype=np.float32)
 
     frame_images: list[Image.Image] = []
-    for i in range(n_frames):
-        frame_rows = []
-        sweep_specs = [
-            ("orientation", float(orientation_vals[i])),
-            ("size", float(size_vals[i])),
-            ("floor_hue", float(color_vals[i])),
-            ("wall_hue", float(color_vals[i])),
-            ("object_hue", float(color_vals[i])),
-        ]
-        for key, val in sweep_specs:
-            p = dict(main_params)
-            p[key] = val
-            img = _render_np(p)
-            img_hwc = np.transpose(img, (1, 2, 0))
-            diff_hwc = _autograd_diff_rgb(main_params, key=key, val=val)
-            row = np.concatenate([img_hwc, diff_hwc], axis=1)
-            frame_rows.append(row)
+    factor_specs = [
+        ("orientation", torch.from_numpy(orientation_vals).to(device=device), 1),
+        ("size", torch.from_numpy(size_vals).to(device=device), 0),
+        ("floor_hue", torch.from_numpy(color_vals).to(device=device), 2),
+        ("wall_hue", torch.from_numpy(color_vals).to(device=device), 3),
+        ("object_hue", torch.from_numpy(color_vals).to(device=device), 4),
+    ]
 
-        frame = np.concatenate(frame_rows, axis=0)
+    base_shape = torch.full((n_frames,), float(main_params["shape"]), dtype=torch.float32, device=device)
+    base_size = torch.full((n_frames,), float(main_params["size"]), dtype=torch.float32, device=device)
+    base_ori = torch.full((n_frames,), float(main_params["orientation"]), dtype=torch.float32, device=device)
+    base_floor = torch.full((n_frames,), float(main_params["floor_hue"]), dtype=torch.float32, device=device)
+    base_wall = torch.full((n_frames,), float(main_params["wall_hue"]), dtype=torch.float32, device=device)
+    base_obj = torch.full((n_frames,), float(main_params["object_hue"]), dtype=torch.float32, device=device)
+
+    chunk_size = 8
+
+    # row_frames_by_factor[k][t] is the k-th factor row at time t.
+    row_frames_by_factor: list[list[np.ndarray]] = []
+    for key, vals_t, jac_idx in factor_specs:
+        shape_t = base_shape.clone()
+        size_t = base_size.clone()
+        ori_t = base_ori.clone()
+        floor_t = base_floor.clone()
+        wall_t = base_wall.clone()
+        obj_t = base_obj.clone()
+        if key == "orientation":
+            ori_t = vals_t
+        elif key == "size":
+            size_t = vals_t
+        elif key == "floor_hue":
+            floor_t = vals_t
+        elif key == "wall_hue":
+            wall_t = vals_t
+        elif key == "object_hue":
+            obj_t = vals_t
+
+        factor_rows: list[np.ndarray] = []
+        for st in range(0, n_frames, chunk_size):
+            ed = min(st + chunk_size, n_frames)
+            jac, img = renderer.forward(
+                fixed_shape_id, 
+                size_t[st:ed], 
+                ori_t[st:ed], 
+                floor_t[st:ed], 
+                wall_t[st:ed], 
+                obj_t[st:ed], 
+                return_grad=True
+            )
+            img_np = img.detach().cpu().numpy()  # (Tc,3,H,W)
+            diff_np = jac[jac_idx].detach().cpu().numpy()  # (Tc,3,H,W)
+
+            for t in range(ed - st):
+                img_hwc = np.transpose(img_np[t], (1, 2, 0))
+                diff_hwc = np.transpose(diff_np[t], (1, 2, 0))
+                scale = float(np.percentile(np.abs(diff_hwc), 99.5))
+                if scale < 1e-8:
+                    scale = 1.0
+                diff_vis = np.clip(0.5 + 0.5 * (diff_hwc / scale), 0.0, 1.0).astype(np.float32)
+                factor_rows.append(np.concatenate([img_hwc, diff_vis], axis=1))
+        row_frames_by_factor.append(factor_rows)
+        print(f"{key}: batched {n_frames} frames done (chunk={chunk_size})")
+
+    for t in range(n_frames):
+        frame = np.concatenate([row_frames_by_factor[k][t] for k in range(len(row_frames_by_factor))], axis=0)
         frame_u8 = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
         frame_images.append(Image.fromarray(frame_u8))
-        print(f"frame {i + 1}/{n_frames} done")
+        print(f"frame {t + 1}/{n_frames} assembled")
 
     gif_path = out_dir / "main_factors_and_differentials.gif"
     frame_images[0].save(
