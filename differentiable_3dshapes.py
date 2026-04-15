@@ -325,35 +325,38 @@ def _ray_object_hit_interval_t(
     t_far: float = 100.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Analytic entry/exit interval along ray parameter t (world-distance parameter)."""
+    # Shape notation:
+    #   P = ray grid dims (e.g. B,H,W) or any broadcastable leading dims.
+    #   Vector tensors have shape (P, 3), scalar fields have shape (P,).
     dtype = ray_dir_world.dtype
     device = ray_dir_world.device
-    inf = torch.full_like(ray_dir_world[..., 0], float("inf"))
-    ninf = torch.full_like(ray_dir_world[..., 0], -float("inf"))
-    eps = torch.as_tensor(1e-10, device=device, dtype=dtype)
-    sqrt_eps = torch.as_tensor(1e-12, device=device, dtype=dtype)
+    inf = torch.full_like(ray_dir_world[..., 0], float("inf"))  # (P,)
+    ninf = torch.full_like(ray_dir_world[..., 0], -float("inf"))  # (P,)
+    eps = torch.as_tensor(1e-10, device=device, dtype=dtype)  # ()
+    sqrt_eps = torch.as_tensor(1e-12, device=device, dtype=dtype)  # ()
 
-    scale_xyz_safe = torch.clamp(scale_xyz, min=1e-8)
-    ro = (ray_origin_world - center_world) / scale_xyz_safe
-    rd = ray_dir_world / scale_xyz_safe
+    scale_xyz_safe = torch.clamp(scale_xyz, min=1e-8)  # (P, 3)
+    ro = (ray_origin_world - center_world) / scale_xyz_safe  # (P, 3)
+    rd = ray_dir_world / scale_xyz_safe  # (P, 3)
 
-    ox, oy, oz = ro[..., 0], ro[..., 1], ro[..., 2]
-    dx, dy, dz = rd[..., 0], rd[..., 1], rd[..., 2]
+    ox, oy, oz = ro[..., 0], ro[..., 1], ro[..., 2]  # each (P,)
+    dx, dy, dz = rd[..., 0], rd[..., 1], rd[..., 2]  # each (P,)
 
     if shape_id == 0:
-        parallel = torch.abs(rd) < eps
-        outside_parallel = parallel & ((ro < -1.0) | (ro > 1.0))
-        no_hit_parallel = outside_parallel.any(dim=-1)
-        rd_safe = torch.where(torch.abs(rd) > eps, rd, torch.where(rd >= 0.0, eps, -eps))
-        inv_rd = 1.0 / rd_safe
-        t0 = (-1.0 - ro) * inv_rd
-        t1 = (1.0 - ro) * inv_rd
-        t_near_axis = torch.minimum(t0, t1)
-        t_far_axis = torch.maximum(t0, t1)
-        t_near_axis = torch.where(parallel, ninf[..., None], t_near_axis)
-        t_far_axis = torch.where(parallel, inf[..., None], t_far_axis)
-        t_enter = t_near_axis.max(dim=-1).values
-        t_exit = t_far_axis.min(dim=-1).values
-        valid = (~no_hit_parallel) & (t_exit >= t_enter) & (t_exit > 0.0)
+        parallel = torch.abs(rd) < eps  # (P, 3)
+        outside_parallel = parallel & ((ro < -1.0) | (ro > 1.0))  # (P, 3)
+        no_hit_parallel = outside_parallel.any(dim=-1)  # (P,)
+        rd_safe = torch.where(torch.abs(rd) > eps, rd, torch.where(rd >= 0.0, eps, -eps))  # (P, 3)
+        inv_rd = 1.0 / rd_safe  # (P, 3)
+        t0 = (-1.0 - ro) * inv_rd  # (P, 3)
+        t1 = (1.0 - ro) * inv_rd  # (P, 3)
+        t_near_axis = torch.minimum(t0, t1)  # (P, 3)
+        t_far_axis = torch.maximum(t0, t1)  # (P, 3)
+        t_near_axis = torch.where(parallel, ninf[..., None], t_near_axis)  # (P, 3)
+        t_far_axis = torch.where(parallel, inf[..., None], t_far_axis)  # (P, 3)
+        t_enter = t_near_axis.max(dim=-1).values  # (P,)
+        t_exit = t_far_axis.min(dim=-1).values  # (P,)
+        valid = (~no_hit_parallel) & (t_exit >= t_enter) & (t_exit > 0.0)  # (P,)
         return torch.where(valid, t_enter, inf), torch.where(valid, t_exit, ninf)
 
     def _push_root(
@@ -371,15 +374,15 @@ def _ray_object_hit_interval_t(
 
     def _quadratic(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Solve quadratic roots robustly and return `(t0, t1, valid_mask)`."""
-        disc = b * b - 4.0 * a * c
-        den = 2.0 * a
-        den_ok = torch.abs(den) > eps
-        root_ok = (disc >= 0.0) & den_ok
-        den_safe = torch.where(den_ok, den, torch.ones_like(den))
+        disc = b * b - 4.0 * a * c  # (P,)
+        den = 2.0 * a  # (P,)
+        den_ok = torch.abs(den) > eps  # (P,)
+        root_ok = (disc >= 0.0) & den_ok  # (P,)
+        den_safe = torch.where(den_ok, den, torch.ones_like(den))  # (P,)
         # Avoid infinite/unstable gradients around tangential hits (disc ~= 0).
-        sqrt_disc = torch.sqrt(torch.clamp(disc, min=sqrt_eps))
-        t0 = (-b - sqrt_disc) / den_safe
-        t1 = (-b + sqrt_disc) / den_safe
+        sqrt_disc = torch.sqrt(torch.clamp(disc, min=sqrt_eps))  # (P,)
+        t0 = (-b - sqrt_disc) / den_safe  # (P,)
+        t1 = (-b + sqrt_disc) / den_safe  # (P,)
         return t0, t1, root_ok
 
     if shape_id == 2:
@@ -436,11 +439,11 @@ def _ray_object_hit_interval_t(
 
     if len(roots) == 0:
         return inf, ninf
-    t_stack = torch.stack(roots, dim=0)
-    valid_stack = torch.stack(valids, dim=0)
-    t_enter = torch.where(valid_stack, t_stack, inf).min(dim=0).values
-    t_exit = torch.where(valid_stack, t_stack, ninf).max(dim=0).values
-    valid = torch.any(valid_stack, dim=0) & (t_exit >= t_enter) & (t_exit > 0.0)
+    t_stack = torch.stack(roots, dim=0)  # (K, P)
+    valid_stack = torch.stack(valids, dim=0)  # (K, P)
+    t_enter = torch.where(valid_stack, t_stack, inf).min(dim=0).values  # (P,)
+    t_exit = torch.where(valid_stack, t_stack, ninf).max(dim=0).values  # (P,)
+    valid = torch.any(valid_stack, dim=0) & (t_exit >= t_enter) & (t_exit > 0.0)  # (P,)
     return torch.where(valid, t_enter, inf), torch.where(valid, t_exit, ninf)
 
 

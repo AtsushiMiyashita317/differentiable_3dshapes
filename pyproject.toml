@@ -9,16 +9,9 @@ description = "Differentiable 3D Shapes renderer utilities"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "torch==2.6.0",
     "numpy==1.26.4",
     "Pillow",
-]
-
-[project.optional-dependencies]
-cpu = [
-    "torch==2.5.1",
-]
-cu124 = [
-    "torch==2.5.1+cu124",
 ]
 
 [tool.setuptools]
