@@ -12,6 +12,7 @@ import source as r3d
 
 
 def _make_inputs(batch_size: int, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    """Sample random latent factors used for profiling runs."""
     return {
         "shape": torch.randint(0, 4, (batch_size,), device=device, dtype=torch.int64),
         "size": torch.empty((batch_size,), device=device, dtype=dtype).uniform_(0.7, 1.5),
@@ -23,6 +24,7 @@ def _make_inputs(batch_size: int, device: torch.device, dtype: torch.dtype) -> d
 
 
 def _synchronize_if_needed(device: torch.device) -> None:
+    """Synchronize CUDA work so timing includes actual kernel execution."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -37,6 +39,7 @@ def profile_render(
     dtype: torch.dtype,
     out_path: Path | None,
 ) -> None:
+    """Run line profiling for the renderer and print/save timing breakdown."""
     inputs = _make_inputs(batch_size=batch_size, device=device, dtype=dtype)
 
     kwargs = dict(
@@ -50,6 +53,7 @@ def profile_render(
     renderer = r3d.Render3DShapesModule(**kwargs).to(device)
 
     def run_once() -> torch.Tensor:
+        """Single profiled forward pass."""
         return renderer.forward(
             shape=inputs["shape"],
             size=inputs["size"],
@@ -60,7 +64,7 @@ def profile_render(
             return_grad=False,
         )
 
-    # Warmup
+    # Warm up kernels/allocators before collecting profile numbers.
     for _ in range(warmup):
         _ = run_once()
         _synchronize_if_needed(device)
@@ -77,6 +81,7 @@ def profile_render(
 
     wrapped = lp(run_once)
 
+    # Profile timing across repeated wrapped calls.
     t0 = time.perf_counter()
     for _ in range(repeats):
         _ = wrapped()
@@ -101,6 +106,7 @@ def profile_render(
 
 
 def main() -> None:
+    """Parse CLI options and execute the line profiler."""
     parser = argparse.ArgumentParser(description="Line profiler for renderer_3dshapes_sim.py")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=3)
