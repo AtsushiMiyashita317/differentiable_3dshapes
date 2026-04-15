@@ -764,7 +764,7 @@ def render_3dshapes_image(
         return out[0]
     return out
 
-class Render3DShapesModule(nn.Module):
+class Differentiable3Dshapes(nn.Module):
     """nn.Module wrapper around `render_3dshapes_image`.
 
     Main factors are provided to `forward`; all other renderer settings are fixed at init.
@@ -982,7 +982,7 @@ if __name__ == "__main__":
         use_auto_grounding=True,
     )
 
-    renderer = Render3DShapesModule(
+    renderer = Differentiable3Dshapes(
         hue_v=0.9,
         orientation_period=1.0,
         shadow_strength=0.8,
