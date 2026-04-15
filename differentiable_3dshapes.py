@@ -29,7 +29,7 @@ def _parse_image_size(image_size: int | Tuple[int, int]) -> Tuple[int, int]:
 @dataclass(frozen=True)
 class CameraConfig:
     radius: float = 6.0
-    height: float = 1.0
+    height: float = 1.8
     target: Tuple[float, float, float] = (0.0, 1.0, 0.0)
     yaw_offset_deg: float = 0.0
 
@@ -455,7 +455,6 @@ def render_3dshapes_image(
     object_hue: float | torch.Tensor,
     *,
     hue_v: float | torch.Tensor = 0.9,
-    orientation_period: float | torch.Tensor = 1.0,
     shadow_strength: float | torch.Tensor = 10.0,
     ssaa_scale: int = 4,
     image_size: int | Tuple[int, int] = 64,
@@ -508,15 +507,8 @@ def render_3dshapes_image(
     room_config = room_config or RoomConfig()
     object_config = object_config or ObjectConfig()
 
-    orientation_period_t = _as_torch_scalar(orientation_period, device, dtype)
-    period_eps = _cached_scalar_tensor(dkey[0], dkey[1], dtype, 1e-8)
-    orientation_period_safe = torch.where(
-        torch.abs(orientation_period_t) > period_eps,
-        orientation_period_t,
-        torch.where(orientation_period_t >= 0.0, period_eps, -period_eps),
-    )
     yaw_offset_deg_t = _as_torch_scalar(camera_config.yaw_offset_deg, device, dtype)
-    theta = 2.0 * torch.pi * torch.remainder(ori_b / orientation_period_safe, 1.0) + (
+    theta = 2.0 * torch.pi * torch.remainder(ori_b, 1.0) + (
         yaw_offset_deg_t * (torch.pi / 180.0)
     )
 
@@ -774,7 +766,6 @@ class Differentiable3Dshapes(nn.Module):
         self,
         *,
         hue_v: float | torch.Tensor = 0.9,
-        orientation_period: float | torch.Tensor = 1.0,
         shadow_strength: float | torch.Tensor = 1.0,
         ssaa_scale: int = 4,
         image_size: int | Tuple[int, int] = 64,
@@ -787,7 +778,6 @@ class Differentiable3Dshapes(nn.Module):
     ) -> None:
         super().__init__()
         self.hue_v = hue_v
-        self.orientation_period = orientation_period
         self.shadow_strength = shadow_strength
         self.ssaa_scale = ssaa_scale
         self.image_size = image_size
@@ -810,7 +800,6 @@ class Differentiable3Dshapes(nn.Module):
     ) -> torch.Tensor | tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         kwargs = dict(
             hue_v=self.hue_v,
-            orientation_period=self.orientation_period,
             shadow_strength=self.shadow_strength,
             ssaa_scale=self.ssaa_scale,
             image_size=self.image_size,
@@ -939,6 +928,17 @@ class Differentiable3Dshapes(nn.Module):
         return out
 
 
+__all__ = [
+    "CameraConfig",
+    "RoomConfig",
+    "ObjectConfig",
+    "LightingConfig",
+    "MeshResolutionConfig",
+    "render_3dshapes_image",
+    "Differentiable3Dshapes",
+]
+
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
@@ -984,10 +984,9 @@ if __name__ == "__main__":
 
     renderer = Differentiable3Dshapes(
         hue_v=0.9,
-        orientation_period=1.0,
         shadow_strength=0.8,
-        ssaa_scale=1,
-        image_size=256,
+        ssaa_scale=4,
+        image_size=64,
         lighting_config=light_cfg,
         mesh_resolution_config=mesh_res_cfg,
         camera_config=cam_cfg,
@@ -995,27 +994,18 @@ if __name__ == "__main__":
         object_config=obj_cfg,
         output_chw=True,
     )
+    renderer = Differentiable3Dshapes()
     renderer = renderer.to(device)
 
     out_dir = Path("samples")
     out_dir.mkdir(exist_ok=True)
     main_params = dict(
-        shape=1,
+        shape=2,
         size=1.0,
         orientation=0.0,
         floor_hue=0.0,
         wall_hue=0.33,
         object_hue=0.66,
-        # orientation_period=1.0,
-        # lighting_config=light_cfg,
-        # mesh_resolution_config=mesh_res_cfg,
-        # camera_config=cam_cfg,
-        # room_config=room_cfg,
-        # object_config=obj_cfg,
-        # output_chw=True,
-        # shadow_strength=10,
-        # ssaa_scale=8,
-        # image_size=64,
     )
     fixed_shape_id = int(main_params["shape"])
 

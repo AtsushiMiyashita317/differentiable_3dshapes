@@ -5,5 +5,7 @@ __pycache__/
 samples/
 profiles/
 
+*.egg-info/
+
 *.h5
 

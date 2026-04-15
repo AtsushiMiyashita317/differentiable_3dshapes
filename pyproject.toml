@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "differentiable-3dshapes"
+version = "0.1.0"
+description = "Differentiable 3D Shapes renderer utilities"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy==1.26.4",
+    "Pillow",
+    "torch==2.5.1+cu124",
+]
+
+[tool.setuptools]
+py-modules = [
+    "differentiable_3dshapes",
+]

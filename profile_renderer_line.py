@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from line_profiler import LineProfiler
 
-import renderer_3dshapes_sim as r3d
+import source as r3d
 
 
 def _make_inputs(batch_size: int, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
@@ -41,7 +41,6 @@ def profile_render(
 
     kwargs = dict(
         hue_v=0.9,
-        orientation_period=1.0,
         shadow_strength=0.8,
         ssaa_scale=ssaa_scale,
         image_size=image_size,
