@@ -11,6 +11,13 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy==1.26.4",
     "Pillow",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "torch==2.5.1",
+]
+cu124 = [
     "torch==2.5.1+cu124",
 ]
 
