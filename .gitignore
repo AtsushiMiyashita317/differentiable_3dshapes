@@ -3,5 +3,7 @@ venv/
 __pycache__/
 
 samples/
+profiles/
 
 *.h5
+
