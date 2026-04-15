@@ -465,6 +465,11 @@ def _factor_to_1d(
     return torch.tensor([float(x)], device=device, dtype=dtype)
 
 
+def _has_explicit_batch_dim(x: int | float | torch.Tensor) -> bool:
+    """Return True when input already carries a batch axis."""
+    return bool(torch.is_tensor(x) and x.ndim >= 1)
+
+
 @dataclass(frozen=True)
 class _RenderContext:
     # Notation: B=batch_size, H=render_h, W=render_w, S=#surfaces.
@@ -490,6 +495,7 @@ class _RenderContext:
     room_config: RoomConfig
     object_config: ObjectConfig
     output_chw: bool
+    keep_batch_dim_when_single: bool
 
 
 @dataclass(frozen=True)
@@ -568,6 +574,9 @@ def _prepare_render_context(
     floor_hue_batch = _factor_to_1d(floor_hue, device=device, dtype=dtype, name="floor_hue")
     wall_hue_batch = _factor_to_1d(wall_hue, device=device, dtype=dtype, name="wall_hue")
     object_hue_batch = _factor_to_1d(object_hue, device=device, dtype=dtype, name="object_hue")
+    keep_batch_dim_when_single = any(
+        _has_explicit_batch_dim(x) for x in (size, orientation, floor_hue, wall_hue, object_hue)
+    )
 
     batch_lengths = [
         size_batch.shape[0],
@@ -619,6 +628,7 @@ def _prepare_render_context(
         room_config=room_config or RoomConfig(),
         object_config=object_config or ObjectConfig(),
         output_chw=output_chw,
+        keep_batch_dim_when_single=keep_batch_dim_when_single,
     )
 
 
@@ -995,7 +1005,7 @@ def _finalize_render_output(out: torch.Tensor, *, ctx: _RenderContext) -> torch.
         out = _downsample_mean(out, ctx.ssaa_scale)
     if ctx.output_chw:
         out = out.permute(0, 3, 1, 2)
-    if ctx.batch_size == 1:
+    if ctx.batch_size == 1 and not ctx.keep_batch_dim_when_single:
         return out[0]
     return out
 
@@ -1123,6 +1133,9 @@ class Differentiable3Dshapes(nn.Module):
         floor_b = _factor_to_1d(floor_hue, device=device, dtype=dtype, name="floor_hue")
         wall_b = _factor_to_1d(wall_hue, device=device, dtype=dtype, name="wall_hue")
         obj_b = _factor_to_1d(object_hue, device=device, dtype=dtype, name="object_hue")
+        keep_batch_dim_when_single = any(
+            _has_explicit_batch_dim(x) for x in (shape, size, orientation, floor_hue, wall_hue, object_hue)
+        )
 
         lengths = [shape_b.shape[0], size_b.shape[0], ori_b.shape[0], floor_b.shape[0], wall_b.shape[0], obj_b.shape[0]]
         bsz = max(lengths)
@@ -1191,11 +1204,14 @@ class Differentiable3Dshapes(nn.Module):
 
             if jac_out is None or img_out is None:
                 raise RuntimeError("No valid shape ids in input.")
+            if bsz == 1 and not keep_batch_dim_when_single:
+                img_out = img_out[0]
+                jac_out = [j[0] for j in jac_out]
             return tuple(jac_out), img_out
 
         if bsz == 1:
             sid = int(shape_ids[0].item())
-            return render_3dshapes_image(
+            out_single = render_3dshapes_image(
                 shape=sid,
                 size=size_b,
                 orientation=ori_b,
@@ -1204,6 +1220,9 @@ class Differentiable3Dshapes(nn.Module):
                 object_hue=obj_b,
                 **kwargs,
             )
+            if not keep_batch_dim_when_single and out_single.ndim == 4:
+                return out_single[0]
+            return out_single
 
         out: torch.Tensor | None = None
         for sid in range(4):
