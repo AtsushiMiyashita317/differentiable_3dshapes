@@ -1,4 +1,5 @@
 venv/
+.venv/
 
 __pycache__/
 
@@ -8,4 +9,3 @@ profiles/
 *.egg-info/
 
 *.h5
-

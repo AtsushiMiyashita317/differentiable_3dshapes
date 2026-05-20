@@ -12,6 +12,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+SEGMENTATION_CLASS_NAMES = (
+    "background",
+    "floor",
+    "wall_back",
+    "wall_front",
+    "wall_left",
+    "wall_right",
+    "object",
+)
+SEGMENTATION_BACKGROUND = 0
+SEGMENTATION_FLOOR = 1
+SEGMENTATION_WALL_BACK = 2
+SEGMENTATION_WALL_FRONT = 3
+SEGMENTATION_WALL_LEFT = 4
+SEGMENTATION_WALL_RIGHT = 5
+SEGMENTATION_OBJECT = 6
+
 # ------------------------------
 # Utility
 # ------------------------------
@@ -76,6 +93,13 @@ class MeshResolutionConfig:
     sphere_lon_steps: int = 72
     capsule_radial_steps: int = 56
     capsule_hemi_steps: int = 18
+
+
+@dataclass(frozen=True)
+class SegmentationOutput:
+    labels: torch.Tensor
+    masks: torch.Tensor
+    class_names: Tuple[str, ...] = SEGMENTATION_CLASS_NAMES
 
 
 # ------------------------------
@@ -536,6 +560,7 @@ class _Layer:
     t: torch.Tensor  # (B, H, W)
     color: torch.Tensor  # (B, H, W, 3)
     alpha: torch.Tensor  # (B, H, W)
+    class_id: int
 
 
 def _prepare_render_context(
@@ -876,6 +901,7 @@ def _render_floor_layer(
         t=torch.where(is_valid_floor, t_floor, scene.infinite_t),
         color=torch.where(is_valid_floor[..., None], floor_color, torch.zeros_like(floor_color)),
         alpha=alpha_floor,
+        class_id=SEGMENTATION_FLOOR,
     )
 
 
@@ -888,7 +914,13 @@ def _render_wall_layers(
     """Render enabled room walls as independent compositing layers."""
     layers: list[_Layer] = []
 
-    def _make_wall_layer(enabled: bool, axis: int, coord: torch.Tensor, normal: torch.Tensor) -> None:
+    def _make_wall_layer(
+        enabled: bool,
+        axis: int,
+        coord: torch.Tensor,
+        normal: torch.Tensor,
+        class_id: int,
+    ) -> None:
         if not enabled:
             return
         t_wall, wall_hit_world, is_valid_wall = _plane_hit(axis=axis, coord=coord, ctx=ctx, rays=rays, scene=scene)
@@ -919,13 +951,38 @@ def _render_wall_layers(
                 t=torch.where(is_valid_wall, t_wall, scene.infinite_t),
                 color=torch.where(is_valid_wall[..., None], wall_color, torch.zeros_like(wall_color)),
                 alpha=alpha_wall,
+                class_id=class_id,
             )
         )
 
-    _make_wall_layer(ctx.room_config.draw_back_wall, axis=2, coord=scene.room_min_z, normal=scene.room_surface_normals[1])
-    _make_wall_layer(ctx.room_config.draw_front_wall, axis=2, coord=scene.room_max_z, normal=scene.room_surface_normals[2])
-    _make_wall_layer(ctx.room_config.draw_left_wall, axis=0, coord=scene.room_min_x, normal=scene.room_surface_normals[3])
-    _make_wall_layer(ctx.room_config.draw_right_wall, axis=0, coord=scene.room_max_x, normal=scene.room_surface_normals[4])
+    _make_wall_layer(
+        ctx.room_config.draw_back_wall,
+        axis=2,
+        coord=scene.room_min_z,
+        normal=scene.room_surface_normals[1],
+        class_id=SEGMENTATION_WALL_BACK,
+    )
+    _make_wall_layer(
+        ctx.room_config.draw_front_wall,
+        axis=2,
+        coord=scene.room_max_z,
+        normal=scene.room_surface_normals[2],
+        class_id=SEGMENTATION_WALL_FRONT,
+    )
+    _make_wall_layer(
+        ctx.room_config.draw_left_wall,
+        axis=0,
+        coord=scene.room_min_x,
+        normal=scene.room_surface_normals[3],
+        class_id=SEGMENTATION_WALL_LEFT,
+    )
+    _make_wall_layer(
+        ctx.room_config.draw_right_wall,
+        axis=0,
+        coord=scene.room_max_x,
+        normal=scene.room_surface_normals[4],
+        class_id=SEGMENTATION_WALL_RIGHT,
+    )
     return layers
 
 
@@ -963,7 +1020,7 @@ def _render_object_layer(
     alpha_obj = _occlusion_from_segment_length(view_segment, sharpness=5.0)
     alpha_obj = torch.where(is_valid_object, torch.clamp(alpha_obj, 0.0, 1.0), scene.zero_alpha)
 
-    return _Layer(t=t_obj_hit, color=obj_color, alpha=alpha_obj)
+    return _Layer(t=t_obj_hit, color=obj_color, alpha=alpha_obj, class_id=SEGMENTATION_OBJECT)
 
 
 def _composite_layers(
@@ -971,8 +1028,9 @@ def _composite_layers(
     *,
     ctx: _RenderContext,
     scene: _SceneParams,
-) -> torch.Tensor:
-    """Front-to-back alpha compositing after per-pixel depth sorting."""
+    return_masks: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Front-to-back alpha compositing, optionally with class contribution masks."""
     layer_t_stack = torch.stack([layer.t for layer in layers], dim=0)
     layer_color_stack = torch.stack([layer.color for layer in layers], dim=0)
     layer_alpha_stack = torch.stack([layer.alpha for layer in layers], dim=0)
@@ -987,16 +1045,37 @@ def _composite_layers(
         sorted_idx[..., None].expand(-1, -1, -1, -1, 3),
     )
     sorted_alpha = torch.where(torch.isfinite(sorted_t), sorted_alpha, torch.zeros_like(sorted_alpha))
+    sorted_class: torch.Tensor | None = None
+    if return_masks:
+        layer_class_stack = torch.tensor(
+            [layer.class_id for layer in layers],
+            device=ctx.device,
+            dtype=torch.long,
+        )[:, None, None, None].expand_as(layer_t_stack)
+        sorted_class = torch.gather(layer_class_stack, 0, sorted_idx)
 
     remaining_transmittance = torch.ones((ctx.batch_size, ctx.render_h, ctx.render_w, 1), device=ctx.device, dtype=ctx.dtype)
     accumulated_rgb = torch.zeros_like(scene.background_rgb)
+    masks: torch.Tensor | None = None
+    if return_masks:
+        masks = torch.zeros(
+            (ctx.batch_size, len(SEGMENTATION_CLASS_NAMES), ctx.render_h, ctx.render_w),
+            device=ctx.device,
+            dtype=ctx.dtype,
+        )
     for depth_order in range(sorted_t.shape[0]):
         alpha_i = sorted_alpha[depth_order]  # (B, H, W)
         color_i = sorted_color[depth_order]  # (B, H, W, 3)
-        accumulated_rgb = accumulated_rgb + remaining_transmittance * alpha_i[..., None] * color_i
+        contrib_i = remaining_transmittance[..., 0] * alpha_i
+        accumulated_rgb = accumulated_rgb + contrib_i[..., None] * color_i
+        if masks is not None and sorted_class is not None:
+            masks.scatter_add_(1, sorted_class[depth_order].unsqueeze(1), contrib_i.unsqueeze(1))
         remaining_transmittance = remaining_transmittance * (1.0 - alpha_i[..., None])
 
-    return accumulated_rgb + remaining_transmittance * scene.background_rgb
+    if masks is not None:
+        background_contrib = remaining_transmittance[..., 0]
+        masks[:, SEGMENTATION_BACKGROUND] = masks[:, SEGMENTATION_BACKGROUND] + background_contrib
+    return accumulated_rgb + remaining_transmittance * scene.background_rgb, masks
 
 
 def _finalize_render_output(out: torch.Tensor, *, ctx: _RenderContext) -> torch.Tensor:
@@ -1008,6 +1087,17 @@ def _finalize_render_output(out: torch.Tensor, *, ctx: _RenderContext) -> torch.
     if ctx.batch_size == 1 and not ctx.keep_batch_dim_when_single:
         return out[0]
     return out
+
+
+def _finalize_segmentation_output(masks: torch.Tensor, *, ctx: _RenderContext) -> SegmentationOutput:
+    """Apply SSAA downsampling and make hard labels from class contribution masks."""
+    if ctx.ssaa_scale > 1:
+        masks = F.interpolate(masks, size=(ctx.base_h, ctx.base_w), mode="area")
+    masks = masks.detach()
+    labels = torch.argmax(masks, dim=1).to(torch.long)
+    if ctx.batch_size == 1 and not ctx.keep_batch_dim_when_single:
+        return SegmentationOutput(labels=labels[0], masks=masks[0])
+    return SegmentationOutput(labels=labels, masks=masks)
 
 
 def render_3dshapes_image(
@@ -1028,7 +1118,8 @@ def render_3dshapes_image(
     room_config: RoomConfig | None = None,
     object_config: ObjectConfig | None = None,
     output_chw: bool = True,
-) -> torch.Tensor:
+    return_segmentation: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, SegmentationOutput]:
     """Differentiable renderer for a fixed shape id.
 
     `shape` is treated as an integer (0..3). For mixed-shape batches, use
@@ -1060,8 +1151,13 @@ def render_3dshapes_image(
     layers.extend(_render_wall_layers(ctx=ctx, rays=rays, scene=scene))
     layers.append(_render_object_layer(ctx=ctx, rays=rays, scene=scene))
 
-    out = _composite_layers(layers, ctx=ctx, scene=scene)
-    return _finalize_render_output(out, ctx=ctx)
+    out, masks = _composite_layers(layers, ctx=ctx, scene=scene, return_masks=return_segmentation)
+    image = _finalize_render_output(out, ctx=ctx)
+    if return_segmentation:
+        if masks is None:
+            raise RuntimeError("Segmentation masks were not computed.")
+        return image, _finalize_segmentation_output(masks, ctx=ctx)
+    return image
 
 class Differentiable3Dshapes(nn.Module):
     """nn.Module wrapper around `render_3dshapes_image`.
@@ -1105,8 +1201,14 @@ class Differentiable3Dshapes(nn.Module):
         wall_hue: float | torch.Tensor,
         object_hue: float | torch.Tensor,
         return_grad: bool = False,
-    ) -> torch.Tensor | tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        """Render images (and optionally Jacobians) for batched latent factors."""
+        return_segmentation: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, SegmentationOutput]
+        | tuple[tuple[torch.Tensor, ...], torch.Tensor]
+        | tuple[tuple[torch.Tensor, ...], torch.Tensor, SegmentationOutput]
+    ):
+        """Render images, optionally with Jacobians and segmentation masks."""
         kwargs = dict(
             hue_v=self.hue_v,
             shadow_strength=self.shadow_strength,
@@ -1159,6 +1261,8 @@ class Differentiable3Dshapes(nn.Module):
             # Group by discrete shape id so each group can use fixed-shape jacfwd.
             jac_out: list[torch.Tensor] | None = None
             img_out: torch.Tensor | None = None
+            seg_labels_out: torch.Tensor | None = None
+            seg_masks_out: torch.Tensor | None = None
             for sid in range(4):
                 idx = torch.nonzero(shape_ids == sid, as_tuple=False).reshape(-1)
                 if idx.numel() == 0:
@@ -1202,11 +1306,48 @@ class Differentiable3Dshapes(nn.Module):
                 for k in range(5):
                     jac_out[k][idx] = jac_g[k]
 
+                if return_segmentation:
+                    with torch.no_grad():
+                        _, seg_g = render_3dshapes_image(
+                            shape=sid,
+                            size=size_b[idx],
+                            orientation=ori_b[idx],
+                            floor_hue=floor_b[idx],
+                            wall_hue=wall_b[idx],
+                            object_hue=obj_b[idx],
+                            return_segmentation=True,
+                            **kwargs,
+                        )
+                    labels_g = seg_g.labels if seg_g.labels.ndim == 3 else seg_g.labels.unsqueeze(0)
+                    masks_g = seg_g.masks if seg_g.masks.ndim == 4 else seg_g.masks.unsqueeze(0)
+                    if seg_labels_out is None or seg_masks_out is None:
+                        seg_labels_out = torch.empty(
+                            (bsz,) + tuple(labels_g.shape[1:]),
+                            device=labels_g.device,
+                            dtype=labels_g.dtype,
+                        )
+                        seg_masks_out = torch.empty(
+                            (bsz,) + tuple(masks_g.shape[1:]),
+                            device=masks_g.device,
+                            dtype=masks_g.dtype,
+                        )
+                    seg_labels_out[idx] = labels_g
+                    seg_masks_out[idx] = masks_g
+
             if jac_out is None or img_out is None:
                 raise RuntimeError("No valid shape ids in input.")
+            seg_out: SegmentationOutput | None = None
+            if return_segmentation:
+                if seg_labels_out is None or seg_masks_out is None:
+                    raise RuntimeError("No valid segmentation outputs.")
+                seg_out = SegmentationOutput(labels=seg_labels_out, masks=seg_masks_out)
             if bsz == 1 and not keep_batch_dim_when_single:
                 img_out = img_out[0]
                 jac_out = [j[0] for j in jac_out]
+                if seg_out is not None:
+                    seg_out = SegmentationOutput(labels=seg_out.labels[0], masks=seg_out.masks[0])
+            if seg_out is not None:
+                return tuple(jac_out), img_out, seg_out
             return tuple(jac_out), img_out
 
         if bsz == 1:
@@ -1218,13 +1359,24 @@ class Differentiable3Dshapes(nn.Module):
                 floor_hue=floor_b,
                 wall_hue=wall_b,
                 object_hue=obj_b,
+                return_segmentation=return_segmentation,
                 **kwargs,
             )
+            if return_segmentation:
+                image_single, seg_single = out_single
+                if not keep_batch_dim_when_single and image_single.ndim == 4:
+                    return image_single[0], SegmentationOutput(
+                        labels=seg_single.labels[0],
+                        masks=seg_single.masks[0],
+                    )
+                return image_single, seg_single
             if not keep_batch_dim_when_single and out_single.ndim == 4:
                 return out_single[0]
             return out_single
 
         out: torch.Tensor | None = None
+        seg_labels_out: torch.Tensor | None = None
+        seg_masks_out: torch.Tensor | None = None
         for sid in range(4):
             # Render each shape group once, then scatter back into original batch order.
             idx = torch.nonzero(shape_ids == sid, as_tuple=False).reshape(-1)
@@ -1237,8 +1389,26 @@ class Differentiable3Dshapes(nn.Module):
                 floor_hue=floor_b[idx],
                 wall_hue=wall_b[idx],
                 object_hue=obj_b[idx],
+                return_segmentation=return_segmentation,
                 **kwargs,
             )
+            if return_segmentation:
+                out_g, seg_g = out_g
+                labels_g = seg_g.labels if seg_g.labels.ndim == 3 else seg_g.labels.unsqueeze(0)
+                masks_g = seg_g.masks if seg_g.masks.ndim == 4 else seg_g.masks.unsqueeze(0)
+                if seg_labels_out is None or seg_masks_out is None:
+                    seg_labels_out = torch.empty(
+                        (bsz,) + tuple(labels_g.shape[1:]),
+                        device=labels_g.device,
+                        dtype=labels_g.dtype,
+                    )
+                    seg_masks_out = torch.empty(
+                        (bsz,) + tuple(masks_g.shape[1:]),
+                        device=masks_g.device,
+                        dtype=masks_g.dtype,
+                    )
+                seg_labels_out[idx] = labels_g
+                seg_masks_out[idx] = masks_g
             if out_g.ndim == 3:
                 out_g = out_g.unsqueeze(0)
             if out is None:
@@ -1247,6 +1417,10 @@ class Differentiable3Dshapes(nn.Module):
 
         if out is None:
             raise RuntimeError("No valid shape ids in input.")
+        if return_segmentation:
+            if seg_labels_out is None or seg_masks_out is None:
+                raise RuntimeError("No valid segmentation outputs.")
+            return out, SegmentationOutput(labels=seg_labels_out, masks=seg_masks_out)
         return out
 
 
@@ -1256,6 +1430,15 @@ __all__ = [
     "ObjectConfig",
     "LightingConfig",
     "MeshResolutionConfig",
+    "SegmentationOutput",
+    "SEGMENTATION_CLASS_NAMES",
+    "SEGMENTATION_BACKGROUND",
+    "SEGMENTATION_FLOOR",
+    "SEGMENTATION_WALL_BACK",
+    "SEGMENTATION_WALL_FRONT",
+    "SEGMENTATION_WALL_LEFT",
+    "SEGMENTATION_WALL_RIGHT",
+    "SEGMENTATION_OBJECT",
     "render_3dshapes_image",
     "Differentiable3Dshapes",
 ]
