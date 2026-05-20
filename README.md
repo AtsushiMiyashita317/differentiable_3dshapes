@@ -39,7 +39,7 @@ Classes are ordered as:
 )
 ```
 
-Generate image, differential, and segmentation samples:
+Generate image, differential, segmentation, and factor-sweep GIF samples:
 
 ```bash
 python generate_segmentation_samples.py --device auto
